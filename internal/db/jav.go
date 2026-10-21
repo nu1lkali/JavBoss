@@ -3022,6 +3022,35 @@ func (store *Store) ListJavCodesForDirectory(ctx context.Context, directoryID in
 	return codes, nil
 }
 
+// ListJavProcessingCandidates 返回指定目录下参与整理的 JAV 及其视频相对路径，
+// 供调用方结合磁盘上是否已有 JavBoss 写的 NFO 判断“是否还有未整理项”。
+// 过滤条件与 ListJavsForDirectoryProcessing 保持一致（同目录、目录未删除、目录可用）。
+func (store *Store) ListJavProcessingCandidates(ctx context.Context, directoryID int64) ([]JavProcessingCandidate, error) {
+	if directoryID <= 0 {
+		return nil, errors.New("directory id must be positive")
+	}
+	var rows []JavProcessingCandidate
+	if err := store.conn.WithContext(ctx).
+		Table("jav j").
+		Select("j.id AS jav_id, j.code AS code, vl.relative_path AS relative_path").
+		Joins("JOIN video_location vl ON vl.jav_id = j.id").
+		Joins("JOIN directory d ON d.id = vl.directory_id").
+		Where("vl.directory_id = ?", directoryID).
+		Where(activeDirectoryWhereSQL("d")).
+		Order("vl.relative_path").
+		Scan(&rows).Error; err != nil {
+		return nil, fmt.Errorf("list JAV processing candidates: %w", err)
+	}
+	return rows, nil
+}
+
+// JavProcessingCandidate 是整理前探测用的轻量记录：只带番号与视频相对路径。
+type JavProcessingCandidate struct {
+	JavID        int64  `gorm:"column:jav_id"`
+	Code         string `gorm:"column:code"`
+	RelativePath string `gorm:"column:relative_path"`
+}
+
 // ListJavsNeedingStudioNames returns coded JAVs whose studio is missing or non-English.
 func (store *Store) ListJavsNeedingStudioNames(ctx context.Context) ([]JavEnrichmentItem, error) {
 	var studios []models.JavStudio

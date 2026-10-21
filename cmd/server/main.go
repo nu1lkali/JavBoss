@@ -199,7 +199,17 @@ func run() int {
 	dataDir := filepath.Dir(cfg.DatabasePath)
 	ffmpeg.Init(ctx, baseDir)
 
-	directory.Init(ctx, cfg.JavCoverDir)
+	// 自动整理：扫描入库后无需手动点“执行”，直接补齐 NFO 与封面。
+	autoProcessMode := common.AutoProcessMode()
+	autoProcessCoverWait := common.AutoProcessCoverWait()
+	if autoProcessMode != "" {
+		logger.Printf("auto process enabled: mode=%s cover_wait=%s", autoProcessMode, autoProcessCoverWait)
+	}
+	directory.InitWithOptions(ctx, directory.Options{
+		CoverDir:             cfg.JavCoverDir,
+		AutoProcessMode:      autoProcessMode,
+		AutoProcessCoverWait: autoProcessCoverWait,
+	})
 	translation.Init(ctx)
 	defer func() {
 		stop()
@@ -227,6 +237,8 @@ func run() int {
 			return
 		case <-timer.C:
 			directory.StartAutomaticDirectoryScanScheduler(ctx, 30*time.Second)
+			// 自动整理 worker 与扫描调度分开：扫描只负责入库，整理由它按队列执行。
+			directory.StartAutoProcessScheduler(ctx, 30*time.Second)
 			download.Start(ctx)
 			enrichment.StartCensoredStudioEnrichment(ctx, time.Minute)
 			enrichment.StartCensoredSeriesEnrichment(ctx, time.Minute)

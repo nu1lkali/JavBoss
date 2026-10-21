@@ -189,6 +189,8 @@ func (m *Manager) StartManualDirectoryScan(directory models.Directory) error {
 			if err := enqueueMissingCoversForDirectory(m.ctx, directory.ID); err != nil && !errors.Is(err, context.Canceled) {
 				logging.Error("jav cover enqueue after manual scan failed: id=%d err=%v", directory.ID, err)
 			}
+			// 扫描会话已释放；登记自动整理后立即返回，等待封面由后台 worker 负责。
+			m.queueAutoProcess(directory)
 		}
 	}()
 	return nil
@@ -292,7 +294,7 @@ func walkAndReconcileVideoFiles(ctx context.Context, directory models.Directory,
 
 		logging.Info("scan file: root=%s path=%s size=%d", normalizedRoot, relativePath, info.Size())
 
-		meta, err := util.ProbeVideoContext(ctx, normalizedPath)
+		fileEntry, err := buildFileEntry(ctx, directory, normalizedRoot, relativePath, normalizedPath, info)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return err
@@ -300,23 +302,53 @@ func walkAndReconcileVideoFiles(ctx context.Context, directory models.Directory,
 			logging.Error("probe video metadata error: %v", err)
 			return nil
 		}
-		fingerprint := meta.FingerprintV2(info.Size())
-		durationSec := int64(math.Round(meta.DurationSeconds))
-
-		fileEntry := &FileEntry{
-			DirectoryID:   directory.ID,
-			DirectoryPath: normalizedRoot,
-			RelativePath:  relativePath,
-			AbsolutePath:  normalizedPath,
-			Filename:      info.Name(),
-			Size:          info.Size(),
-			ModifiedAt:    modTime,
-			Fingerprint:   fingerprint,
-			DurationSec:   durationSec,
+		if fileEntry == nil {
+			return nil
 		}
 
 		return upsertVideo(ctx, fileEntry, state, summary)
 	})
+}
+
+// buildFileEntry 为一个媒体文件构建待入库条目。
+// STRM 文件内容是播放地址而非视频数据，不能交给 ffprobe，因此按指针内容生成指纹；
+// 普通视频文件仍然使用容器元数据 + 文件大小的指纹。
+// 返回 nil 表示该文件本轮应当跳过（例如空 STRM）。
+func buildFileEntry(
+	ctx context.Context,
+	directory models.Directory,
+	normalizedRoot string,
+	relativePath string,
+	normalizedPath string,
+	info fs.FileInfo,
+) (*FileEntry, error) {
+	fileEntry := &FileEntry{
+		DirectoryID:   directory.ID,
+		DirectoryPath: normalizedRoot,
+		RelativePath:  relativePath,
+		AbsolutePath:  normalizedPath,
+		Filename:      info.Name(),
+		Size:          info.Size(),
+		ModifiedAt:    info.ModTime().UTC(),
+	}
+
+	if util.IsStrmFile(normalizedPath) {
+		ref, err := util.ReadStrmReference(normalizedPath)
+		if err != nil {
+			// 空指针或读取失败时退化为按相对路径生成指纹，保证条目仍能入库并参与番号刮削。
+			logging.Info("strm target unavailable, fall back to path fingerprint: path=%s err=%v", relativePath, err)
+		}
+		fileEntry.Fingerprint = util.StrmFingerprint(directory.ID, relativePath, ref)
+		return fileEntry, nil
+	}
+
+	meta, err := util.ProbeVideoContext(ctx, normalizedPath)
+	if err != nil {
+		return nil, err
+	}
+	fileEntry.Fingerprint = meta.FingerprintV2(info.Size())
+	fileEntry.DurationSec = int64(math.Round(meta.DurationSeconds))
+	return fileEntry, nil
 }
 
 // upsertVideo 根据文件指纹复用或创建视频，并写入当前目录中的文件位置。

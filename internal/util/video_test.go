@@ -295,37 +295,63 @@ func TestReleaseFFBinaryLookupOnlyUsesExecutableDirectory(t *testing.T) {
 	}
 }
 
-func TestDockerFFBinaryLookupOnlyUsesFixedImagePath(t *testing.T) {
+func TestDockerFFBinaryLookupOnlyUsesImagePaths(t *testing.T) {
 	t.Setenv("JAVBOSS_BUILD_MODE", "release")
 	t.Setenv("JAVBOSS_CONTAINER", "1")
 	t.Chdir(t.TempDir())
 	t.Setenv("FFMPEG_PATH", "/ignored/ffmpeg")
 	t.Setenv("FFPROBE_PATH", "/ignored/ffprobe")
+	execPath, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundledPath := filepath.Join(filepath.Dir(execPath), "internal", "bin")
 	for _, name := range []string{"ffmpeg", "ffprobe"} {
-		for _, installed := range []bool{true, false} {
-			t.Run(fmt.Sprintf("%s/installed=%t", name, installed), func(t *testing.T) {
-				want := "/app/internal/bin/" + name
-				var calls []string
-				lookup := func(candidate string) (string, error) {
-					calls = append(calls, candidate)
-					if candidate == want && !installed {
+		imagePath := ContainerFFBinaryDir + "/" + name
+		fallbackPath := filepath.Join(bundledPath, name)
+		for _, imageInstalled := range []bool{true, false} {
+			for _, bundledInstalled := range []bool{true, false} {
+				t.Run(fmt.Sprintf("%s/image=%t/bundled=%t", name, imageInstalled, bundledInstalled), func(t *testing.T) {
+					var calls []string
+					lookup := func(candidate string) (string, error) {
+						calls = append(calls, candidate)
+						switch candidate {
+						case imagePath:
+							if imageInstalled {
+								return candidate, nil
+							}
+						case fallbackPath:
+							if bundledInstalled {
+								return candidate, nil
+							}
+						default:
+							// Working directory or PATH binaries would expose an unwanted fallback.
+							return candidate, nil
+						}
 						return "", os.ErrNotExist
 					}
-					// Other paths would succeed, exposing any unwanted fallback.
-					return candidate, nil
-				}
-				got, err := findFFBinaryPathWithLookup(name, lookup)
-				if len(calls) != 1 || calls[0] != want {
-					t.Fatalf("lookup paths = %v, want only %s", calls, want)
-				}
-				if installed {
-					if err != nil || got != want {
-						t.Fatalf("got %q, %v; want %q", got, err, want)
+					got, err := findFFBinaryPathWithLookup(name, lookup)
+					for _, candidate := range calls {
+						if candidate != imagePath && candidate != fallbackPath {
+							t.Fatalf("lookup path %q is outside the image paths %v", candidate, []string{imagePath, fallbackPath})
+						}
 					}
-				} else if err == nil || got != "" {
-					t.Fatalf("missing image binary must fail without fallback: %q, %v", got, err)
-				}
-			})
+					switch {
+					case imageInstalled:
+						if err != nil || got != imagePath {
+							t.Fatalf("got %q, %v; want %q", got, err, imagePath)
+						}
+					case bundledInstalled:
+						if err != nil || got != fallbackPath {
+							t.Fatalf("got %q, %v; want %q", got, err, fallbackPath)
+						}
+					default:
+						if err == nil || got != "" {
+							t.Fatalf("missing image binary must fail without fallback: %q, %v", got, err)
+						}
+					}
+				})
+			}
 		}
 	}
 }

@@ -250,11 +250,18 @@ func (m *Manager) dispatchDueAutomaticDirectoryScans(
 				if !errors.Is(err, ErrDirectoryScanInProgress) && !errors.Is(err, context.Canceled) {
 					logging.Error("automatic directory scan failed id=%d path=%s err=%v", current.ID, current.Path, err)
 				}
+				// 扫描被占用（可能是上一轮自动整理后的重扫尚未结束）时不要直接放弃：
+				// 仍登记自动整理，让“已刮削但未写 NFO”的条目有机会补齐。
+				if !errors.Is(err, context.Canceled) {
+					m.queueAutoProcess(*current)
+				}
 				return
 			}
 			if err := enqueueMissingCoversForDirectory(ctx, current.ID); err != nil && !errors.Is(err, context.Canceled) {
 				logging.Error("jav cover enqueue after automatic scan failed id=%d err=%v", current.ID, err)
 			}
+			// ScanDirectory 已释放扫描会话，登记后由后台 worker 择机整理。
+			m.queueAutoProcess(*current)
 		}(dir.ID, now)
 	}
 	return nil

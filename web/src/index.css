@@ -975,6 +975,28 @@ body.has-page-scroll .sticky-pagination {
   }
 }
 
+/* NFO 批量重建：总量未知，用不定量滑动条表示"正在跑"。 */
+.nfo-rebuild-bar__fill {
+  animation: nfo-rebuild-slide 1.4s ease-in-out infinite;
+}
+
+@keyframes nfo-rebuild-slide {
+  0% {
+    transform: translateX(-100%);
+  }
+
+  100% {
+    transform: translateX(400%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nfo-rebuild-bar__fill {
+    width: 100%;
+    animation: none;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .directory-setup-hint__arrow {
     animation: none;

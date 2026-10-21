@@ -184,6 +184,13 @@ func getVideoStreams(c *gin.Context) {
 		return
 	}
 
+	// STRM 指针文件本身没有媒体数据，播放地址来自文件内容：
+	// 网络流直接交给客户端，本地路径则解析为实际媒体文件。
+	if target, ok := resolveStrmPlaybackTarget(fullPath); ok {
+		c.JSON(http.StatusOK, buildStrmPlaybackInfo(video, locationID, target))
+		return
+	}
+
 	probe, err := util.ProbePlaybackSupport(fullPath)
 	if err != nil {
 		logging.Error("probe playback support error: %v", err)
@@ -192,6 +199,70 @@ func getVideoStreams(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, buildPlaybackInfo(video, locationID, probe))
+}
+
+// resolveStrmPlaybackTarget 解析 STRM 指针的播放目标。
+// 返回 ok=false 表示这不是 STRM 条目或指针无法解析，调用方应回退到常规探测流程。
+//
+// 本地路径目标只有在文件真实存在时才采用，否则回退到常规流程，
+// 以便播放错误信息保持原有的语义。
+func resolveStrmPlaybackTarget(fullPath string) (util.StrmPlaybackTarget, bool) {
+	if !util.IsStrmFile(fullPath) {
+		return util.StrmPlaybackTarget{}, false
+	}
+	ref, err := util.ReadStrmReference(fullPath)
+	if err != nil {
+		logging.Info("read strm playback target failed: path=%s err=%v", fullPath, err)
+		return util.StrmPlaybackTarget{}, false
+	}
+	target, ok := util.StrmPlaybackTargetFromReference(ref)
+	if !ok {
+		return util.StrmPlaybackTarget{}, false
+	}
+	if target.IsLocal() {
+		if _, statErr := os.Stat(target.LocalPath); statErr != nil {
+			logging.Info("strm local target unavailable: path=%s err=%v", target.LocalPath, statErr)
+			return util.StrmPlaybackTarget{}, false
+		}
+	}
+	return target, true
+}
+
+// buildStrmPlaybackInfo 为 STRM 条目构建播放信息。
+// 网络流使用 direct 类型，由浏览器或播放器直连；本地文件使用 HLS，
+// 由服务端转码切片，与常规视频的处理方式一致。
+func buildStrmPlaybackInfo(video *models.Video, locationID int64, target util.StrmPlaybackTarget) playbackInfo {
+	info := playbackInfo{
+		VideoID:       video.ID,
+		LocationID:    locationID,
+		PreferredKind: "direct",
+		Sources:       []playbackSource{},
+	}
+	if target.IsURL() {
+		info.Sources = append(info.Sources, playbackSource{
+			Kind:     "direct",
+			Src:      target.URL,
+			MimeType: directMimeType(strings.TrimPrefix(target.Extension, ".")),
+			Label:    "STRM",
+		})
+		return info
+	}
+
+	// 本地目标：直连由服务端代理跳转，HLS 走常规切片流程。
+	info.Sources = append(info.Sources, playbackSource{
+		Kind:     "direct",
+		Src:      buildDirectStreamURL(video, locationID),
+		MimeType: directMimeType(strings.TrimPrefix(target.Extension, ".")),
+		Label:    "Direct",
+	})
+	info.Sources = append(info.Sources, playbackSource{
+		Kind:     "hls",
+		Src:      buildHLSStreamURL(video, locationID),
+		MimeType: stream.MimeHLS,
+		Label:    "HLS",
+	})
+	info.PreferredKind = "hls"
+	return info
 }
 
 func buildPlaybackInfo(video *models.Video, locationID int64, probe *util.PlaybackProbeResult) playbackInfo {
@@ -241,7 +312,71 @@ func streamVideo(c *gin.Context) {
 			return
 		}
 	}
+	// STRM 条目不能按普通文件直接输出，需要跳转到指针指向的地址。
+	if redirectStrmStream(c, fullPath) {
+		return
+	}
 	serveVideoFile(c, fullPath)
+}
+
+// redirectStrmStream 处理 STRM 条目的直连请求并返回是否已经响应。
+func redirectStrmStream(c *gin.Context, fullPath string) bool {
+	target, ok := resolveStrmPlaybackTarget(fullPath)
+	if !ok {
+		return false
+	}
+	if target.IsURL() {
+		c.Redirect(http.StatusFound, target.URL)
+		return true
+	}
+	localURL, err := buildStreamURLForLocalFile(c, target.LocalPath)
+	if err != nil {
+		respondPlaybackError(c, err)
+		return true
+	}
+	c.Redirect(http.StatusFound, localURL)
+	return true
+}
+
+// buildStreamURLForLocalFile 把本地媒体路径换算成同一套目录路径参数的直连地址。
+// 目录必须落在已登记目录内，否则拒绝，避免通过指针文件读取任意路径。
+func buildStreamURLForLocalFile(c *gin.Context, localPath string) (string, error) {
+	cleaned := filepath.Clean(localPath)
+	bestRoot := ""
+	bestRel := ""
+	for _, dirPath := range registeredDirectoryPaths(c) {
+		rel, err := filepath.Rel(dirPath, cleaned)
+		if err != nil || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
+			continue
+		}
+		if len(dirPath) > len(bestRoot) {
+			bestRoot = dirPath
+			bestRel = rel
+		}
+	}
+	if bestRoot == "" {
+		return "", fmt.Errorf("strm target is outside registered directories: %s", localPath)
+	}
+	query := url.Values{}
+	query.Set("dir_path", bestRoot)
+	query.Set("path", filepath.ToSlash(bestRel))
+	return "/videos/stream?" + query.Encode(), nil
+}
+
+// registeredDirectoryPaths 返回当前已登记目录的绝对路径列表。
+func registeredDirectoryPaths(c *gin.Context) []string {
+	dirs, err := dbpkg.Default().ListActiveDirectories(c.Request.Context())
+	if err != nil {
+		logging.Error("list directories for strm stream failed: %v", err)
+		return nil
+	}
+	paths := make([]string, 0, len(dirs))
+	for _, dir := range dirs {
+		if path := strings.TrimSpace(dir.Path); path != "" {
+			paths = append(paths, filepath.Clean(path))
+		}
+	}
+	return paths
 }
 
 func streamHLSManifest(c *gin.Context) {

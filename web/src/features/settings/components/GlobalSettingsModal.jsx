@@ -84,7 +84,68 @@ const BROWSER_PLAYER_DEFAULTS = {
   showHotkeyHint: true,
 }
 
+// 自动整理的整理方式，与后端 JAVBOSS_AUTO_PROCESS 的取值一一对应。
+// 这是容器级配置，网页里只展示、不提供修改。
+const AUTO_PROCESS_MODE_LABELS = {
+  sidecar: {
+    zh: '仅生成 NFO 与封面（不移动文件）',
+    en: 'Write NFO and covers only (files stay in place)',
+  },
+  organize: {
+    zh: '仅按番号整理目录',
+    en: 'Organize into folders by code only',
+  },
+  organize_with_sidecar: {
+    zh: '整理目录并生成 NFO 与封面',
+    en: 'Organize, then write NFO and covers',
+  },
+}
+
 const DEFAULT_PROXY_HOST = '127.0.0.1'
+
+// 把 /nfo/rebuild 返回的统计拼成一行中文说明。
+function formatNFORebuildSummary(summary, dryRun) {
+  if (!summary) return ''
+  const parts = [
+    zh(`共检查 ${summary.videos} 个视频`, `Checked ${summary.videos} videos`),
+    zh(`空壳 ${summary.shells} 个`, `${summary.shells} shells`),
+    zh(`缺失 ${summary.missing} 个`, `${summary.missing} missing`),
+    zh(`外部完整 ${summary.preserved} 个`, `${summary.preserved} kept as-is`),
+  ]
+  parts.push(
+    dryRun
+      ? zh(
+          `可重建 ${Number(summary.shells || 0) + Number(summary.missing || 0)} 个`,
+          `${Number(summary.shells || 0) + Number(summary.missing || 0)} rebuildable`
+        )
+      : zh(`已重建 ${summary.rebuilt} 个`, `${summary.rebuilt} rebuilt`)
+  )
+  if (summary.no_metadata) {
+    parts.push(zh(`缺刮削数据 ${summary.no_metadata} 个`, `${summary.no_metadata} without metadata`))
+  }
+  if (summary.failed) {
+    parts.push(zh(`失败 ${summary.failed} 个`, `${summary.failed} failed`))
+  }
+  return parts.join('，')
+}
+
+// 任务跑起来后，轮询中途的统计拼成一行实时进度。
+// 后端每处理 50 个视频回传一次，所以这里只会看到跳跃式增长的计数。
+function formatNFORebuildProgress(summary, dryRun) {
+  if (!summary) return ''
+  const checked = Number(summary.videos) || 0
+  if (checked <= 0) return ''
+  const head = dryRun
+    ? zh(`已检查 ${checked} 个`, `Checked ${checked}`)
+    : zh(`已处理 ${checked} 个`, `Processed ${checked}`)
+  const tail = dryRun
+    ? zh(
+        `，空壳 ${Number(summary.shells) || 0} 个、缺失 ${Number(summary.missing) || 0} 个`,
+        `, ${Number(summary.shells) || 0} shells, ${Number(summary.missing) || 0} missing`
+      )
+    : zh(`，已重写 ${Number(summary.rebuilt) || 0} 个`, `, ${Number(summary.rebuilt) || 0} rewritten`)
+  return head + tail
+}
 
 export default function GlobalSettingsModal({
   open,
@@ -110,6 +171,17 @@ export default function GlobalSettingsModal({
   onSaveProxySettings,
   allowLANAccess = false,
   onSaveAllowLANAccess,
+  autoProcessEnabled = false,
+  autoProcessAvailable = true,
+  autoProcessMode = '',
+  onSaveAutoProcessEnabled,
+  onRebuildNFO,
+  nfoRebuildProgress = null,
+  embyEnabled = false,
+  embyURL = '',
+  embyAPIKeySet = false,
+  onSaveEmbySettings,
+  onTestEmbyConnection,
   defaultPlayer,
   onSaveDefaultPlayer,
   initialViewMode,
@@ -146,6 +218,22 @@ export default function GlobalSettingsModal({
   const [allowLANAccessInput, setAllowLANAccessInput] = useState(false)
   const [allowLANAccessError, setAllowLANAccessError] = useState('')
   const [savingAllowLANAccess, setSavingAllowLANAccess] = useState(false)
+  const [autoProcessEnabledInput, setAutoProcessEnabledInput] = useState(false)
+  const [autoProcessError, setAutoProcessError] = useState('')
+  const [savingAutoProcess, setSavingAutoProcess] = useState(false)
+  const [nfoRebuildBusy, setNfoRebuildBusy] = useState(false)
+  const [nfoRebuildMessage, setNfoRebuildMessage] = useState('')
+  const [nfoRebuildError, setNfoRebuildError] = useState('')
+  // 当前跑的是统计还是重建，决定实时进度文案的措辞。
+  const [nfoRebuildDryRun, setNfoRebuildDryRun] = useState(false)
+  // Emby 联动：地址/密钥用受控输入，密钥只在"确实改了"时才随保存一起提交。
+  const [embyEnabledInput, setEmbyEnabledInput] = useState(false)
+  const [embyURLInput, setEmbyURLInput] = useState('')
+  const [embyAPIKeyInput, setEmbyAPIKeyInput] = useState('')
+  const [embyError, setEmbyError] = useState('')
+  const [embyNotice, setEmbyNotice] = useState('')
+  const [savingEmby, setSavingEmby] = useState(false)
+  const [testingEmby, setTestingEmby] = useState(false)
   const [activeSection, setActiveSection] = useState('directories')
   const [defaultPlayerInput, setDefaultPlayerInput] = useState('mpv')
   const [defaultPlayerError, setDefaultPlayerError] = useState('')
@@ -223,6 +311,15 @@ export default function GlobalSettingsModal({
       setProxyError('')
       setAllowLANAccessInput(allowLANAccess === true)
       setAllowLANAccessError('')
+      setAutoProcessEnabledInput(autoProcessEnabled === true)
+      setAutoProcessError('')
+      // Emby 联动：密钥明文不回传，只回"是否已配置"；输入框每次打开都重置，
+      // 避免上一次没保存的密钥残留在界面上。
+      setEmbyEnabledInput(embyEnabled === true)
+      setEmbyURLInput(embyURL || '')
+      setEmbyAPIKeyInput('')
+      setEmbyError('')
+      setEmbyNotice('')
       setDefaultPlayerInput(
         defaultPlayer === 'browser' || (defaultPlayer === 'system' && desktopIntegrationEnabled)
           ? defaultPlayer
@@ -257,6 +354,7 @@ export default function GlobalSettingsModal({
     proxyPort,
     currentProxyMode,
     allowLANAccess,
+    autoProcessEnabled,
     defaultPlayer,
     initialViewMode,
     playerWindowWidth,
@@ -1133,30 +1231,320 @@ export default function GlobalSettingsModal({
     )
   }
 
-  const renderDirectoriesPanel = () => (
-    <div className="space-y-2">
-      <div className="flex items-center gap-1.5 text-xs font-semibold text-zinc-600">
-        <InfoOutlinedIcon fontSize="inherit" className="text-[15px]" aria-hidden="true" />
-        {zh(
-          '添加本地视频目录让 JavBoss 接管，所有内容将自动为您呈现。',
-          'No directories yet. Added folders will be scanned automatically.'
-        )}
+  const renderDirectoriesPanel = () => {
+    const modeLabel = AUTO_PROCESS_MODE_LABELS[autoProcessMode]
+
+    const handleToggleAutoProcess = async (enabled) => {
+      if (savingAutoProcess || !onSaveAutoProcessEnabled) return
+      const previous = autoProcessEnabledInput
+      setAutoProcessEnabledInput(enabled)
+      setAutoProcessError('')
+      setSavingAutoProcess(true)
+      try {
+        await onSaveAutoProcessEnabled(enabled)
+      } catch (err) {
+        setAutoProcessEnabledInput(previous)
+        setAutoProcessError(getErrorMessage(err))
+      } finally {
+        setSavingAutoProcess(false)
+      }
+    }
+
+    const liveNFORebuildProgress = formatNFORebuildProgress(nfoRebuildProgress, nfoRebuildDryRun)
+
+    // Emby 联动：开关切换后立即保存；地址/密钥走「保存」按钮，
+    // 密钥输入框有值时才提交，空表示保留已保存的密钥不变。
+    const handleToggleEmby = async (enabled) => {
+      if (savingEmby || !onSaveEmbySettings) return
+      const previous = embyEnabledInput
+      setEmbyEnabledInput(enabled)
+      setEmbyError('')
+      setSavingEmby(true)
+      try {
+        await onSaveEmbySettings({ jav_emby_enabled: Boolean(enabled) })
+      } catch (err) {
+        setEmbyEnabledInput(previous)
+        setEmbyError(getErrorMessage(err))
+      } finally {
+        setSavingEmby(false)
+      }
+    }
+
+    const handleSaveEmby = async () => {
+      if (savingEmby || !onSaveEmbySettings) return
+      setEmbyError('')
+      setEmbyNotice('')
+      if (embyEnabledInput && !embyURLInput.trim()) {
+        setEmbyError(
+          zh('开启联动需要先填写 Emby 地址', 'An Emby server URL is required to enable the integration')
+        )
+        return
+      }
+      setSavingEmby(true)
+      try {
+        const payload = {
+          jav_emby_enabled: Boolean(embyEnabledInput),
+          jav_emby_url: embyURLInput.trim(),
+        }
+        if (embyAPIKeyInput.trim() !== '') {
+          payload.jav_emby_api_key = embyAPIKeyInput.trim()
+        }
+        await onSaveEmbySettings(payload)
+        setEmbyAPIKeyInput('')
+        setEmbyNotice(zh('Emby 联动设置已保存', 'Emby integration settings saved'))
+      } catch (err) {
+        setEmbyError(getErrorMessage(err))
+      } finally {
+        setSavingEmby(false)
+      }
+    }
+
+    const handleTestEmby = async () => {
+      if (testingEmby || !onTestEmbyConnection) return
+      setEmbyError('')
+      setEmbyNotice('')
+      setTestingEmby(true)
+      try {
+        const info = await onTestEmbyConnection({
+          url: embyURLInput.trim(),
+          apiKey: embyAPIKeyInput.trim(),
+        })
+        const name = info?.server_name ? `${info.server_name}` : zh('Emby 服务器', 'Emby server')
+        const version = info?.version ? ` ${info.version}` : ''
+        setEmbyNotice(zh(`连接成功：${name}${version}`, `Connected: ${name}${version}`))
+      } catch (err) {
+        setEmbyError(getErrorMessage(err))
+      } finally {
+        setTestingEmby(false)
+      }
+    }
+
+    const runNFORebuild = async (dryRun) => {
+      if (nfoRebuildBusy || !onRebuildNFO) return
+      setNfoRebuildBusy(true)
+      setNfoRebuildDryRun(dryRun)
+      setNfoRebuildError('')
+      setNfoRebuildMessage(dryRun ? zh('正在检查…', 'Checking…') : zh('正在重建，整库可能要几分钟…', 'Rebuilding, this may take a few minutes…'))
+      try {
+        const summary = await onRebuildNFO({ directoryId: 0, dryRun })
+        setNfoRebuildMessage(formatNFORebuildSummary(summary, dryRun))
+      } catch (err) {
+        setNfoRebuildMessage('')
+        setNfoRebuildError(getErrorMessage(err))
+      } finally {
+        setNfoRebuildBusy(false)
+      }
+    }
+
+    return (
+      <div className="space-y-2">
+        <div className="flex items-center gap-1.5 text-xs font-semibold text-zinc-600">
+          <InfoOutlinedIcon fontSize="inherit" className="text-[15px]" aria-hidden="true" />
+          {zh(
+            '添加本地视频目录让 JavBoss 接管，所有内容将自动为您呈现。',
+            'No directories yet. Added folders will be scanned automatically.'
+          )}
+        </div>
+        <section className="rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm">
+          <DirectoryManager
+            open={open}
+            directories={directories}
+            onCreate={onCreateDirectory}
+            onUpdate={onUpdateDirectory}
+            onDelete={onDeleteDirectory}
+            onProcess={onProcessDirectory}
+            onScan={onScanDirectory}
+            onRefresh={onRefreshDirectories}
+            serverOS={serverOS}
+          />
+        </section>
+        <section className="rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <h4 id="auto-process-title" className="text-sm font-semibold text-zinc-800">
+                {zh('扫描后自动整理', 'Process automatically after scanning')}
+              </h4>
+              <p id="auto-process-description" className="mt-1 text-sm text-zinc-500">
+                {zh(
+                  '扫描到新视频后自动写出 NFO 与封面，不需要再手动执行「整理」。关闭后只做扫描和刮削。',
+                  'After a scan finds new videos, NFO and cover files are written automatically — no manual “Organize” run needed. When off, scanning and scraping still run.'
+                )}
+              </p>
+              {modeLabel ? (
+                <p className="mt-1 text-xs text-zinc-500">
+                  {zh('整理方式：', 'Mode: ')}
+                  {zh(modeLabel.zh, modeLabel.en)}
+                </p>
+              ) : null}
+              {!autoProcessAvailable ? (
+                <p className="mt-1 text-xs text-amber-600">
+                  {zh(
+                    '容器环境变量 JAVBOSS_AUTO_PROCESS 已关闭该功能，此开关暂时无效。',
+                    'The container environment variable JAVBOSS_AUTO_PROCESS disables this feature, so the switch has no effect.'
+                  )}
+                </p>
+              ) : null}
+            </div>
+            <Switch
+              size="small"
+              checked={autoProcessEnabledInput}
+              onChange={(_, checked) => handleToggleAutoProcess(checked)}
+              disabled={savingAutoProcess || !autoProcessAvailable || !onSaveAutoProcessEnabled}
+              inputProps={{
+                role: 'switch',
+                'aria-labelledby': 'auto-process-title',
+                'aria-describedby': 'auto-process-description',
+              }}
+            />
+          </div>
+          <div className="mt-4 space-y-2 border-t border-zinc-100 pt-4">
+            <p className="text-sm text-zinc-500">
+              {zh(
+                'NFO 维护：把「只有番号、没有剧情简介」的空壳 NFO 用本地刮削数据重写一遍；已经带剧情简介的外来 NFO 不会被覆盖。',
+                'NFO maintenance: rewrite shell NFO files that only contain a code and no plot, using the metadata already saved locally. NFO files with a real plot are left untouched.'
+              )}
+            </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => runNFORebuild(true)}
+                disabled={nfoRebuildBusy || !onRebuildNFO}
+                className="rounded-xl border border-zinc-200 bg-white px-3 py-1.5 text-sm text-zinc-700 hover:bg-zinc-50 disabled:opacity-50"
+              >
+                {zh('先统计一下', 'Count first')}
+              </button>
+              <button
+                type="button"
+                onClick={() => runNFORebuild(false)}
+                disabled={nfoRebuildBusy || !onRebuildNFO}
+                className="rounded-xl border border-zinc-200 bg-white px-3 py-1.5 text-sm text-zinc-700 hover:bg-zinc-50 disabled:opacity-50"
+              >
+                {zh('重建空壳 NFO', 'Rebuild shell NFO')}
+              </button>
+            </div>
+            {nfoRebuildBusy ? (
+              <div className="space-y-2">
+                <div
+                  className="h-2 overflow-hidden rounded-full bg-zinc-100"
+                  role="progressbar"
+                  aria-label={zh('NFO 重建进度', 'NFO rebuild progress')}
+                >
+                  <div className="nfo-rebuild-bar__fill h-full w-1/4 rounded-full bg-blue-600" />
+                </div>
+                {liveNFORebuildProgress ? (
+                  <p className="text-xs text-zinc-500">{liveNFORebuildProgress}</p>
+                ) : null}
+              </div>
+            ) : null}
+            {nfoRebuildMessage ? (
+              <p className="text-xs text-zinc-500">{nfoRebuildMessage}</p>
+            ) : null}
+            {nfoRebuildError ? (
+              <div className="text-sm text-red-600" role="alert">
+                {nfoRebuildError}
+              </div>
+            ) : null}
+          </div>
+          <div className="rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h4 className="text-sm font-semibold text-zinc-800">
+                  {zh('Emby 联动', 'Emby integration')}
+                </h4>
+                <p className="mt-1 text-sm text-zinc-500">
+                  {zh(
+                    '开启后，批量重建 NFO 或自动整理完成后会自动通知 Emby 刷新媒体库，不需要再手动去 Emby 点「刷新元数据」。',
+                    'When enabled, JavBoss notifies Emby to refresh the library after an NFO rebuild or automatic processing finishes, so you no longer refresh metadata by hand.'
+                  )}
+                </p>
+              </div>
+              <Switch
+                size="small"
+                checked={embyEnabledInput}
+                onChange={(_, checked) => handleToggleEmby(checked)}
+                disabled={savingEmby || !onSaveEmbySettings}
+              />
+            </div>
+            <div className="mt-3 space-y-3">
+              <div>
+                <label htmlFor="emby-url" className="mb-1.5 block text-sm font-medium text-zinc-700">
+                  {zh('Emby 地址', 'Emby server URL')}
+                </label>
+                <input
+                  id="emby-url"
+                  type="text"
+                  value={embyURLInput}
+                  onChange={(event) => {
+                    setEmbyURLInput(event.target.value)
+                    setEmbyError('')
+                    setEmbyNotice('')
+                  }}
+                  placeholder="http://192.168.1.10:8096"
+                  className="w-full rounded-xl border border-zinc-200 bg-white py-2 pl-3 pr-3 text-sm text-zinc-900 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
+                />
+              </div>
+              <div>
+                <label htmlFor="emby-api-key" className="mb-1.5 block text-sm font-medium text-zinc-700">
+                  {zh('API Key', 'API key')}
+                </label>
+                <input
+                  id="emby-api-key"
+                  type="password"
+                  value={embyAPIKeyInput}
+                  onChange={(event) => {
+                    setEmbyAPIKeyInput(event.target.value)
+                    setEmbyError('')
+                    setEmbyNotice('')
+                  }}
+                  placeholder={
+                    embyAPIKeySet
+                      ? zh('已保存，留空则不修改', 'Saved — leave empty to keep')
+                      : zh('Emby 控制台 → API 密钥 → 新建', 'Emby dashboard → API keys → New')
+                  }
+                  className="w-full rounded-xl border border-zinc-200 bg-white py-2 pl-3 pr-3 text-sm text-zinc-900 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
+                />
+                <p className="mt-1 text-xs text-zinc-500">
+                  {zh(
+                    '在 Emby 控制台 → 设置 → API 密钥里新建一个即可。密钥只保存在本机数据库，不会显示在页面上。',
+                    'Create one in the Emby dashboard under Settings → API keys. The key is stored locally and never shown on this page.'
+                  )}
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleSaveEmby}
+                  disabled={savingEmby || !onSaveEmbySettings}
+                  className="rounded-xl border border-zinc-200 bg-white px-3 py-1.5 text-sm text-zinc-700 hover:bg-zinc-50 disabled:opacity-50"
+                >
+                  {zh('保存', 'Save')}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleTestEmby}
+                  disabled={testingEmby || !onTestEmbyConnection}
+                  className="rounded-xl border border-zinc-200 bg-white px-3 py-1.5 text-sm text-zinc-700 hover:bg-zinc-50 disabled:opacity-50"
+                >
+                  {testingEmby ? zh('正在连接…', 'Connecting…') : zh('测试连接', 'Test connection')}
+                </button>
+              </div>
+              {embyNotice ? <p className="text-xs text-green-700">{embyNotice}</p> : null}
+              {embyError ? (
+                <div className="text-sm text-red-600" role="alert">
+                  {embyError}
+                </div>
+              ) : null}
+            </div>
+          </div>
+          {autoProcessError && (
+            <div className="mt-3 text-sm text-red-600" role="alert">
+              {autoProcessError}
+            </div>
+          )}
+        </section>
       </div>
-      <section className="rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm">
-        <DirectoryManager
-          open={open}
-          directories={directories}
-          onCreate={onCreateDirectory}
-          onUpdate={onUpdateDirectory}
-          onDelete={onDeleteDirectory}
-          onProcess={onProcessDirectory}
-          onScan={onScanDirectory}
-          onRefresh={onRefreshDirectories}
-          serverOS={serverOS}
-        />
-      </section>
-    </div>
-  )
+    )
+  }
 
   const renderToolsPanel = () => {
     const installed = Boolean(ffmpegStatus?.installed)

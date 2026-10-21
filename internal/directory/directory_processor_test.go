@@ -1,6 +1,9 @@
 package directory
 
 import (
+	"image"
+	"image/color"
+	"image/jpeg"
 	"os"
 	"path/filepath"
 	"strings"
@@ -155,7 +158,7 @@ func TestProcessJavItemOrganizesAndWritesJellyfinSidecars(t *testing.T) {
 	coverDir := t.TempDir()
 	videoName := "original-name.mkv"
 	writeTestFile(t, filepath.Join(root, videoName), []byte("video"))
-	writeTestFile(t, filepath.Join(coverDir, "ipx-001.jpg"), make([]byte, 31*1024))
+	writeTestJPEG(t, filepath.Join(coverDir, "ipx-001.jpg"), 200, 300)
 
 	uncensored := true
 	item := models.Jav{
@@ -203,7 +206,7 @@ func TestProcessJavItemOrganizesAndWritesJellyfinSidecars(t *testing.T) {
 			t.Fatalf("generated NFO missing %q:\n%s", expected, nfo)
 		}
 	}
-	if _, err := os.Stat(strings.TrimSuffix(targetVideo, ".mkv") + "-poster.jpg"); err != nil {
+	if _, err := os.Stat(filepath.Join(targetDir, "original-name-poster.jpg")); err != nil {
 		t.Fatalf("generated poster missing: %v", err)
 	}
 	if summary.Moved != 1 || summary.Sidecars != 1 || summary.Failed != 0 {
@@ -385,17 +388,22 @@ func TestOrganizeIdolComponentGroupsMoreThanThreeIdols(t *testing.T) {
 	}
 }
 
-func TestWriteJavSidecarsDoesNotOverwriteUserNFO(t *testing.T) {
+func TestWriteJavSidecarsPreservesUserNFOButStillHandlesCover(t *testing.T) {
 	root := t.TempDir()
+	coverDir := t.TempDir()
 	videoPath := filepath.Join(root, "movie.mp4")
 	nfoPath := filepath.Join(root, "movie.nfo")
 	writeTestFile(t, videoPath, []byte("video"))
+	writeTestFile(t, filepath.Join(coverDir, "ipx-001.jpg"), make([]byte, 31*1024))
 	const original = "<movie><title>User metadata</title></movie>"
 	writeTestFile(t, nfoPath, []byte(original))
 
-	err := writeJavSidecars(videoPath, &models.Jav{Code: "IPX-001"}, "")
-	if err == nil {
-		t.Fatal("expected existing user NFO conflict")
+	result, err := writeJavSidecars(t.Context(), videoPath, &models.Jav{Code: "IPX-001"}, coverDir)
+	if err != nil {
+		t.Fatalf("user NFO should not fail the whole Sidecar step: %v", err)
+	}
+	if !result.nfoPreserved || result.nfoWritten {
+		t.Fatalf("result = %+v, want the user NFO preserved and not rewritten", result)
 	}
 	data, readErr := os.ReadFile(nfoPath)
 	if readErr != nil {
@@ -403,6 +411,33 @@ func TestWriteJavSidecarsDoesNotOverwriteUserNFO(t *testing.T) {
 	}
 	if string(data) != original {
 		t.Fatalf("user NFO was modified: %s", data)
+	}
+	// The cover must still be written even though the NFO belongs to another tool.
+	if !result.posterWritten {
+		t.Fatalf("result = %+v, want the poster written despite the foreign NFO", result)
+	}
+	if _, statErr := os.Stat(filepath.Join(root, "movie-poster.jpg")); statErr != nil {
+		t.Fatalf("poster missing next to a video with a foreign NFO: %v", statErr)
+	}
+}
+
+func TestWriteJavSidecarsReportsPendingCoverWhenDownloadsDisabled(t *testing.T) {
+	root := t.TempDir()
+	videoPath := filepath.Join(root, "movie.mp4")
+	writeTestFile(t, videoPath, []byte("video"))
+
+	result, err := writeJavSidecars(t.Context(), videoPath, &models.Jav{Code: "IPX-001"}, "")
+	if err != nil {
+		t.Fatalf("missing cover should not be a hard failure: %v", err)
+	}
+	if !result.nfoWritten {
+		t.Fatalf("result = %+v, want the NFO written", result)
+	}
+	if !result.posterPending || result.posterWritten {
+		t.Fatalf("result = %+v, want the poster reported as pending", result)
+	}
+	if _, statErr := os.Stat(filepath.Join(root, "movie-poster.jpg")); !os.IsNotExist(statErr) {
+		t.Fatalf("poster should not exist without a cached cover: %v", statErr)
 	}
 }
 
@@ -466,7 +501,7 @@ func TestProcessJavItemRecordsMoveFailureThatRemainsAtSource(t *testing.T) {
 	}
 }
 
-func TestProcessJavItemSeparatesSidecarFailureFromMoveFailure(t *testing.T) {
+func TestProcessJavItemKeepsForeignNFOWhileCompletingSidecars(t *testing.T) {
 	root := t.TempDir()
 	videoName := "movie.mp4"
 	writeTestFile(t, filepath.Join(root, "incoming", videoName), []byte("video"))
@@ -491,17 +526,23 @@ func TestProcessJavItemSeparatesSidecarFailureFromMoveFailure(t *testing.T) {
 		summary,
 	)
 
-	if summary.Moved != 1 || summary.Failed != 1 || len(summary.MoveFailures) != 0 ||
-		len(summary.SidecarFailures) != 1 {
-		t.Fatalf("summary = %+v, want a successful move and one Sidecar failure", summary)
+	if summary.Moved != 1 || summary.Failed != 0 || len(summary.MoveFailures) != 0 ||
+		len(summary.SidecarFailures) != 0 {
+		t.Fatalf("summary = %+v, want a successful move with no failures", summary)
 	}
-	failure := summary.SidecarFailures[0]
-	if failure.SourcePath != "JAV/IPX/IPX-001/movie.mp4" ||
-		failure.Reason != "已有非 JavBoss 管理的 NFO，未覆盖该文件" {
-		t.Fatalf("Sidecar failure = %+v", failure)
+	if summary.NFOPreserved != 1 {
+		t.Fatalf("summary = %+v, want one preserved NFO", summary)
+	}
+	if summary.PostersPending != 1 || summary.PostersWritten != 0 {
+		t.Fatalf("summary = %+v, want the poster reported as pending", summary)
+	}
+	targetNFO := filepath.Join(root, "JAV", "IPX", "IPX-001", "movie.nfo")
+	if data, err := os.ReadFile(targetNFO); err != nil ||
+		string(data) != "<movie><title>User metadata</title></movie>" {
+		t.Fatalf("user NFO should survive the move untouched: data=%q err=%v", data, err)
 	}
 	if _, err := os.Stat(filepath.Join(root, "JAV", "IPX", "IPX-001", videoName)); err != nil {
-		t.Fatalf("video should have moved before Sidecar failure: %v", err)
+		t.Fatalf("video should have moved: %v", err)
 	}
 }
 
@@ -517,6 +558,9 @@ func TestWriteDirectoryProcessReportOverwritesPreviousReport(t *testing.T) {
 		Moved:                   2,
 		AlreadyOrganized:        1,
 		Sidecars:                1,
+		NFOPreserved:            3,
+		PostersWritten:          4,
+		PostersPending:          2,
 		Skipped:                 1,
 		Failed:                  2,
 		EmptyDirectoriesRemoved: 2,
@@ -569,6 +613,11 @@ func TestWriteDirectoryProcessReportOverwritesPreviousReport(t *testing.T) {
 		"已经位于目标位置：1",
 		"未满足整理条件：1",
 		"移动失败并留在原处：1",
+		"NFO/封面写入成功：1",
+		"NFO 已存在（已保留）：3",
+		"封面已写入：4",
+		"背景图(fanart)已写入：0",
+		"封面待下载：2",
 		"NFO/封面生成失败：1",
 		"已删除空目录：2",
 		"空目录清理失败：1",
@@ -595,4 +644,33 @@ func writeTestFile(t *testing.T, path string, data []byte) {
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatalf("write test file %s: %v", path, err)
 	}
+}
+
+// writeTestJPEG 生成一张可被 image.Decode 解析的噪点 JPEG。
+// 封面缓存要求文件大于 5KB 且非占位图，纯色图会因体积过小被判为无效，
+// 因此填充伪随机像素；尺寸写死为偶数宽，方便校验裁剪结果。
+func writeTestJPEG(t *testing.T, path string, width, height int) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("create test parent directory: %v", err)
+	}
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	seed := uint32(2463534242)
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			seed ^= seed << 13
+			seed ^= seed >> 17
+			seed ^= seed << 5
+			img.Set(x, y, color.RGBA{R: uint8(seed), G: uint8(seed >> 8), B: uint8(seed >> 16), A: 255})
+		}
+	}
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create test jpeg %s: %v", path, err)
+	}
+	if err := jpeg.Encode(file, img, &jpeg.Options{Quality: 95}); err != nil {
+		file.Close()
+		t.Fatalf("encode test jpeg %s: %v", path, err)
+	}
+	file.Close()
 }

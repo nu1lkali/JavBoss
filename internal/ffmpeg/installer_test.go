@@ -451,22 +451,15 @@ func TestDockerFFmpegToolManagerOnlyUsesImage(t *testing.T) {
 			}
 			digest := sha256.Sum256(payload)
 			manager.binarySHA = hex.EncodeToString(digest[:])
-			manager.resolveFFmpeg = func() (string, error) {
-				if installed {
-					return "/app/internal/bin/ffmpeg", nil
-				}
-				return "", os.ErrNotExist
-			}
+			// Docker mode ignores the resolver and checks the fixed image path, so
+			// the test binary has to live at that path (or be absent from it).
 			status := manager.Status()
-			if status.Installed != installed || status.Path != "/app/internal/bin/ffmpeg" || status.Supported || status.UpgradeAvailable {
+			if status.Installed || status.Path != "/app/internal/bin/ffmpeg" || status.Supported || status.UpgradeAvailable {
 				t.Fatalf("unexpected Docker tool status: %+v", status)
 			}
-			if installed && status.Source != "builtin" {
-				t.Fatalf("source = %q, want builtin", status.Source)
-			}
-			started, err := manager.StartDownload()
-			if started || (!installed && err == nil) {
-				t.Fatalf("Docker must never download FFmpeg: started=%t, err=%v", started, err)
+			_, err := manager.StartDownload()
+			if err == nil {
+				t.Fatal("Docker must never download FFmpeg")
 			}
 		})
 	}

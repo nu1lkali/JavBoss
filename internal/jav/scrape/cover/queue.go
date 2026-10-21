@@ -41,6 +41,12 @@ const (
 var errInvalidCover = errors.New("invalid cover")
 var errCoverNotFound = errors.New("cover not found")
 
+// ErrDownloadsDisabled reports that background cover downloads were not started,
+// so no cover can be fetched on demand.
+var ErrDownloadsDisabled = errors.New("cover downloads are disabled")
+
+var errCoverDownloadsDisabled = ErrDownloadsDisabled
+
 var lookupJavByCode = scrape.LookupJavByCode
 
 // newQueue creates a queue with the built-in cover providers.
@@ -135,6 +141,35 @@ func (m *queue) clearScheduled(code string) {
 	m.mu.Lock()
 	delete(m.scheduled, code)
 	m.mu.Unlock()
+}
+
+// pendingCount 返回尚未处理完的下载任务数（含排队中与正在下载）。
+// 自动整理在写海报前用它判断封面缓存是否已经稳定，避免每个缺失封面
+// 都走 ensureCover 的同步等待。
+func (m *queue) pendingCount() int {
+	if m == nil {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.scheduled)
+}
+
+// downloadNow fetches the cover synchronously, bypassing the background queue.
+// It is used when a caller needs the image on disk immediately (for example to
+// write a poster next to a freshly organized video).
+func (m *queue) downloadNow(ctx context.Context, code string) error {
+	if m == nil {
+		return errCoverDownloadsDisabled
+	}
+	code = normalizeCode(code)
+	if code == "" {
+		return errors.New("empty code")
+	}
+	if exists(m.coverDir, code) {
+		return nil
+	}
+	return handleTask(ctx, m.coverDir, m.providers, code)
 }
 
 func handleTask(ctx context.Context, coverDir string, providers []scrape.Provider, code string) error {

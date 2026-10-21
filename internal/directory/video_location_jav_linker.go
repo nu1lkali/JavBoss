@@ -132,7 +132,9 @@ func processVideoLocationJavLink(ctx context.Context, locationID int64) error {
 		if v.JavID != nil {
 			return nil
 		}
-		if v.DurationSec > 0 && v.DurationSec < 900 {
+		// STRM 指针文件没有可探测的时长，不能套用“时长过短视为花絮”的过滤规则，
+		// 否则所有 STRM 媒体都会被跳过刮削。
+		if !util.IsStrmFile(filename) && v.DurationSec > 0 && v.DurationSec < 900 {
 			return nil
 		}
 	} else if v.JavID != nil {

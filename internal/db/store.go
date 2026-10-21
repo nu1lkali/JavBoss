@@ -27,6 +27,14 @@ func Default() *Store {
 	return store
 }
 
+// Initialized reports whether a default store has been installed.
+//
+// 后台任务会在测试或早期启动阶段被调用，它们需要先判断能否安全访问数据库，
+// 而不是让 Default 直接 panic。
+func Initialized() bool {
+	return defaultStore.Load() != nil
+}
+
 // SetDefault installs the application store and returns the previous value.
 // Use it during startup, or in serial tests that restore the previous store
 // after their workers finish. Replacing a store while jobs run is unsupported.

@@ -20,7 +20,7 @@ var (
 )
 
 func ExtractCodeFromName(name string) []string {
-	base := strings.TrimSuffix(filepath.Base(name), filepath.Ext(name))
+	base := javNameBase(name)
 	var out []string
 	seen := make(map[string]struct{})
 
@@ -30,8 +30,47 @@ func ExtractCodeFromName(name string) []string {
 }
 
 func ExtractUncensoredCodesFromName(name string) []string {
-	base := strings.TrimSuffix(filepath.Base(name), filepath.Ext(name))
+	base := javNameBase(name)
 	return extractUncensoredCodesFromName(base)
+}
+
+// javNameBase 去掉文件名中的媒体扩展名，作为番号解析的输入。
+//
+// 常规情况等价于去一次扩展名；STRM 指针文件可能写成 "ABP-123.strm"，
+// 也可能发生扩展名重复（如 "ABP-123.mp4.strm"、"ABP-123.strm.mp4"）。
+// 需要逐层剥离，直到不再命中视频或 STRM 扩展名，避免残留的 "mp4"/"strm"
+// 片段被当成番号后缀而影响匹配。
+func javNameBase(name string) string {
+	base := filepath.Base(name)
+	for i := 0; i < 4; i++ {
+		ext := strings.ToLower(filepath.Ext(base))
+		if ext == "" {
+			break
+		}
+		if !hasVideoExtension(ext) && ext != StrmExtension {
+			break
+		}
+		stripped := strings.TrimSuffix(base, filepath.Ext(base))
+		if strings.TrimSpace(stripped) == "" {
+			break
+		}
+		base = stripped
+	}
+	return stripFormatTag(base)
+}
+
+// bracketFormatTagRe 匹配紧跟在番号后的格式标记，例如 "miaa-131.(mkv)" 中的 "(mkv)"、
+// "[1080p]"、"{h265}"。这类标记是命名习惯，不是番号的一部分。
+var bracketFormatTagRe = regexp.MustCompile(`\s*[\(\[\{]\s*(?:[0-9]{3,4}[pPiI]|4[kK]|8[kK]|h\.?26[45]|hevc|avc|x26[45]|mkv|mp4|avi|wmv|mov|ts|m2ts|rmvb?|flv|webm|dvd|bd|hd|fhd|uhd|uncensored|leak(?:ed)?|无码|無碼|高清|中字)\s*[\)\]\}]\s*`)
+
+// stripFormatTag 去掉与番号相邻的括号格式标记，避免其被正则吞进番号后缀。
+func stripFormatTag(base string) string {
+	cleaned := bracketFormatTagRe.ReplaceAllString(base, " ")
+	cleaned = strings.TrimSpace(cleaned)
+	if cleaned == "" {
+		return strings.TrimSpace(base)
+	}
+	return cleaned
 }
 
 func extractFC2PPVCodes(base string) []string {

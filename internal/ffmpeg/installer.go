@@ -124,7 +124,7 @@ func newInstaller(ctx context.Context, baseDir string) *installer {
 		containerMode: common.ContainerMode(),
 	}
 	if manager.containerMode {
-		manager.displayPath = util.ContainerFFBinaryDir + "/ffmpeg"
+		manager.displayPath = util.ContainerFFBinaryExePath()
 		manager.bundledDir = util.ContainerFFBinaryDir
 		manager.downloadURL = ""
 		return manager
@@ -189,11 +189,12 @@ func (m *installer) StartDownload() (bool, error) {
 
 func (m *installer) detectInstallation() (bool, string, bool) {
 	if m.containerMode {
-		if m.resolveFFmpeg != nil {
-			resolvedPath, err := m.resolveFFmpeg()
-			if err == nil && resolvedPath == util.ContainerFFBinaryDir+"/ffmpeg" {
-				return true, "builtin", false
-			}
+		// In Docker the binary is a fixed path in the image. The Dockerfile may
+		// point it at the distribution package with a symlink, so path strings
+		// differ from the resolved target; compare files instead of strings.
+		imagePath := util.ContainerFFBinaryExePath()
+		if isUsableFFmpegFile(imagePath) {
+			return true, "builtin", false
 		}
 		return false, "", false
 	}

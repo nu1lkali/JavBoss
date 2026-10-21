@@ -5,7 +5,12 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"image"
+	"image/draw"
+	"image/jpeg"
+	_ "image/png"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -33,6 +38,18 @@ const (
 	directoryMultipleIdols              = "多女优"
 	directoryMaxJoinedIdols             = 3
 	directoryProcessReportName          = "JavBoss-整理报告.txt"
+	// coverEnsureTimeout bounds the synchronous cover fetch performed while
+	// writing a poster, so a slow provider cannot stall the whole job.
+	coverEnsureTimeout = 30 * time.Second
+	// defaultPosterCropLeft 是 DVD 封套左侧小图占整幅宽度的典型比例。
+	defaultPosterCropLeft = 0.53
+	// maxPosterCropLeft 防止误配置把整张封面裁没。
+	maxPosterCropLeft = 0.95
+	// posterSuffix / fanartSuffix 是 Emby 认可的图片后缀写法。
+	// {name}-poster.ext 在 Emby 的 Primary 图片优先序列中排在裸名 poster.ext 之前，
+	// 且不要求“一片一目录”，因此 sidecar 图片统一带视频名。
+	posterSuffix = "-poster"
+	fanartSuffix = "-fanart"
 )
 
 var (
@@ -43,10 +60,19 @@ var (
 
 // DirectoryProcessSummary records the result of one directory processing job.
 type DirectoryProcessSummary struct {
-	Locations                int
-	Moved                    int
-	AlreadyOrganized         int
-	Sidecars                 int
+	Locations        int
+	Moved            int
+	AlreadyOrganized int
+	Sidecars         int
+	// NFOPreserved counts entries whose existing NFO belongs to another tool
+	// and was left untouched while the cover was still processed.
+	NFOPreserved int
+	// PostersWritten counts poster images written next to the media file.
+	PostersWritten int
+	// FanartsWritten counts fanart images written next to the media file.
+	FanartsWritten int
+	// PostersPending counts entries that could not get a cover in this run.
+	PostersPending           int
 	Skipped                  int
 	Failed                   int
 	EmptyDirectoriesRemoved  int
@@ -56,6 +82,9 @@ type DirectoryProcessSummary struct {
 	DirectoryCleanupFailures []DirectoryProcessIssue
 	emptyDirectoryCandidates []string
 }
+
+// errNFOUnownedByOtherTool marks a pre-existing NFO that JavBoss must not overwrite.
+var errNFOUnownedByOtherTool = errors.New("existing NFO is not managed by JavBoss")
 
 // DirectoryProcessIssue describes one file that was not fully processed.
 type DirectoryProcessIssue struct {
@@ -97,6 +126,20 @@ func (m *Manager) setDirectoryProcessingStatus(id int64, status string) {
 
 // StartDirectoryProcessing reserves the directory and starts an asynchronous filesystem job.
 func (m *Manager) StartDirectoryProcessing(ctx context.Context, directory models.Directory, mode, layout string) error {
+	return m.startDirectoryProcessing(ctx, directory, mode, layout, false)
+}
+
+// startDirectoryProcessing 是 StartDirectoryProcessing 的内部实现。
+//
+// noCoverWait 为 true 时本次整理只使用本地已有封面，缺失的条目记
+// posterPending 并交给后台队列继续下载，由后续轮次补齐。自动整理走这条路，
+// 否则整库首次入库会变成“每条缺图各等 30 秒”的长尾。
+func (m *Manager) startDirectoryProcessing(
+	ctx context.Context,
+	directory models.Directory,
+	mode, layout string,
+	noCoverWait bool,
+) error {
 	if err := m.ctx.Err(); err != nil {
 		return err
 	}
@@ -125,24 +168,33 @@ func (m *Manager) StartDirectoryProcessing(ctx context.Context, directory models
 		return err
 	}
 
+	processCtx := m.ctx
+	if noCoverWait {
+		processCtx = withSkipCoverWait(processCtx)
+	}
+
 	go func() {
 		defer m.setDirectoryProcessingStatus(directory.ID, "")
 		defer release()
 
 		startedAt := time.Now()
-		summary, processErr := ProcessDirectory(m.ctx, m.coverDir, directory, mode, layout)
+		summary, processErr := ProcessDirectory(processCtx, m.coverDir, directory, mode, layout)
 		finishedAt := time.Now()
 		if processErr != nil {
 			logging.Error("directory processing failed id=%d mode=%s err=%v", directory.ID, mode, processErr)
 		} else {
 			logging.Info(
-				"directory processing complete id=%d mode=%s locations=%d moved=%d already_organized=%d sidecars=%d skipped=%d failed=%d empty_directories_removed=%d cleanup_failed=%d",
+				"directory processing complete id=%d mode=%s locations=%d moved=%d already_organized=%d sidecars=%d nfo_preserved=%d posters_written=%d fanarts_written=%d posters_pending=%d skipped=%d failed=%d empty_directories_removed=%d cleanup_failed=%d",
 				directory.ID,
 				mode,
 				summary.Locations,
 				summary.Moved,
 				summary.AlreadyOrganized,
 				summary.Sidecars,
+				summary.NFOPreserved,
+				summary.PostersWritten,
+				summary.FanartsWritten,
+				summary.PostersPending,
 				summary.Skipped,
 				summary.Failed,
 				summary.EmptyDirectoriesRemoved,
@@ -321,7 +373,23 @@ func processJavItem(
 		}
 
 		if mode == DirectoryProcessSidecar || mode == DirectoryProcessOrganizeWithSidecar {
-			if err := writeJavSidecars(target, item, coverDir); err != nil {
+			result, err := writeJavSidecars(ctx, target, item, coverDir)
+			if result.changed() {
+				summary.Sidecars++
+			}
+			if result.nfoPreserved {
+				summary.NFOPreserved++
+			}
+			if result.posterWritten {
+				summary.PostersWritten++
+			}
+			if result.fanartWritten {
+				summary.FanartsWritten++
+			}
+			if result.posterPending {
+				summary.PostersPending++
+			}
+			if err != nil {
 				summary.Failed++
 				summary.SidecarFailures = append(summary.SidecarFailures, DirectoryProcessIssue{
 					Code:       code,
@@ -331,7 +399,6 @@ func processJavItem(
 				logging.Error("write JAV Sidecar failed path=%s code=%s err=%v", target, item.Code, err)
 				continue
 			}
-			summary.Sidecars++
 		}
 	}
 }
@@ -638,7 +705,11 @@ func writeDirectoryProcessReport(
 	fmt.Fprintf(&builder, "已经位于目标位置：%d\n", summary.AlreadyOrganized)
 	fmt.Fprintf(&builder, "未满足整理条件：%d\n", summary.Skipped)
 	fmt.Fprintf(&builder, "移动失败并留在原处：%d\n", len(summary.MoveFailures))
-	fmt.Fprintf(&builder, "NFO/封面生成成功：%d\n", summary.Sidecars)
+	fmt.Fprintf(&builder, "NFO/封面写入成功：%d\n", summary.Sidecars)
+	fmt.Fprintf(&builder, "NFO 已存在（已保留）：%d\n", summary.NFOPreserved)
+	fmt.Fprintf(&builder, "封面已写入：%d\n", summary.PostersWritten)
+	fmt.Fprintf(&builder, "背景图(fanart)已写入：%d\n", summary.FanartsWritten)
+	fmt.Fprintf(&builder, "封面待下载：%d\n", summary.PostersPending)
 	fmt.Fprintf(&builder, "NFO/封面生成失败：%d\n", len(summary.SidecarFailures))
 	fmt.Fprintf(&builder, "已删除空目录：%d\n", summary.EmptyDirectoriesRemoved)
 	fmt.Fprintf(&builder, "空目录清理失败：%d\n", len(summary.DirectoryCleanupFailures))
@@ -778,9 +849,14 @@ type jellyfinNFO struct {
 	SortTitle     string          `xml:"sorttitle,omitempty"`
 	UniqueID      jellyfinUnique  `xml:"uniqueid"`
 	Premiered     string          `xml:"premiered,omitempty"`
+	ReleaseDate   string          `xml:"releasedate,omitempty"`
 	Year          int             `xml:"year,omitempty"`
 	Runtime       int             `xml:"runtime,omitempty"`
+	Tagline       string          `xml:"tagline,omitempty"`
+	Outline       string          `xml:"outline,omitempty"`
+	Mpaa          string          `xml:"mpaa,omitempty"`
 	Studio        string          `xml:"studio,omitempty"`
+	DateAdded     string          `xml:"dateadded,omitempty"`
 	Set           *jellyfinSet    `xml:"set,omitempty"`
 	Genres        []string        `xml:"genre,omitempty"`
 	Tags          []string        `xml:"tag,omitempty"`
@@ -803,10 +879,12 @@ type jellyfinActor struct {
 
 func makeJellyfinNFO(item *models.Jav) jellyfinNFO {
 	code := strings.ToUpper(strings.TrimSpace(item.Code))
+	// originaltitle 只放原文标题；中文标题仅在没有原文标题时用来补 title，
+	// 避免把译文写成 originaltitle 造成两个标题语义错位。
 	originalTitle := strings.TrimSpace(item.Title)
 	title := code
-	if originalTitle != "" {
-		title = strings.TrimSpace(code + " " + originalTitle)
+	if label := firstNonEmptyString(item.Title, item.ZhTitle); label != "" {
+		title = strings.TrimSpace(code + " " + label)
 	}
 	result := jellyfinNFO{
 		Generator:     "JavBoss",
@@ -819,11 +897,26 @@ func makeJellyfinNFO(item *models.Jav) jellyfinNFO {
 			Value:   code,
 		},
 		Runtime: item.DurationMin,
+		Mpaa:    "JP-18+",
 	}
 	if item.ReleaseUnix > 0 {
 		released := time.Unix(item.ReleaseUnix, 0).UTC()
 		result.Premiered = released.Format("2006-01-02")
+		result.ReleaseDate = result.Premiered
 		result.Year, _ = strconv.Atoi(released.Format("2006"))
+		// 与常见刮削器的 NFO 保持一致：Jellyfin/Emby 会把 tagline/outline
+		// 显示在影片副标题位置。发行日期是数据库里真实有的信息，直接推导。
+		releaseLabel := "配信開始日 " + result.Premiered
+		result.Tagline = releaseLabel
+		result.Outline = releaseLabel
+	}
+	// Emby/Jellyfin 用 dateadded 排序"最新入库"，取记录写入时间最贴近实际。
+	addedAt := item.CreatedAt
+	if addedAt.IsZero() {
+		addedAt = item.FetchedAt
+	}
+	if !addedAt.IsZero() {
+		result.DateAdded = addedAt.Local().Format("2006-01-02 15:04:05")
 	}
 	if item.Studio != nil {
 		result.Studio = strings.TrimSpace(item.Studio.Name)
@@ -870,39 +963,278 @@ func firstNonEmptyString(values ...string) string {
 	return ""
 }
 
-func writeJavSidecars(videoPath string, item *models.Jav, coverDir string) error {
+// sidecarResult reports what writeJavSidecars actually changed for one video.
+// The NFO and the poster are handled independently so that a pre-existing NFO
+// owned by another tool does not block the cover from being filled in.
+type sidecarResult struct {
+	// nfoWritten is true when JavBoss wrote the NFO in this run.
+	nfoWritten bool
+	// nfoPreserved is true when an NFO owned by another tool was left untouched.
+	nfoPreserved bool
+	// posterWritten is true when a poster image was copied next to the video.
+	posterWritten bool
+	// fanartWritten is true when a fanart image was written next to the video.
+	fanartWritten bool
+	// coverSkipped is true when the poster already existed and needed no update.
+	coverSkipped bool
+	// posterPending is true when no cover is available yet and the download was
+	// only queued, so the poster must be written by a later run.
+	posterPending bool
+}
+
+// changed reports whether this result represents applied work.
+func (r sidecarResult) changed() bool {
+	return r.nfoWritten || r.posterWritten || r.fanartWritten
+}
+
+// writeJavSidecars writes the JavBoss NFO and poster for videoPath.
+//
+// A missing cover is fetched synchronously within coverEnsureTimeout so the
+// poster lands in the same run instead of requiring a second pass. When the
+// download is not configured or times out, the request is queued and the item
+// is reported as posterPending.
+func writeJavSidecars(ctx context.Context, videoPath string, item *models.Jav, coverDir string) (sidecarResult, error) {
+	var result sidecarResult
+
 	info, err := os.Stat(videoPath)
 	if err != nil {
-		return fmt.Errorf("inspect video: %w", err)
+		return result, fmt.Errorf("inspect video: %w", err)
 	}
 	if !info.Mode().IsRegular() {
-		return errors.New("video is not a regular file")
+		return result, errors.New("video is not a regular file")
 	}
 
 	base := strings.TrimSuffix(videoPath, filepath.Ext(videoPath))
 	nfoPath := base + ".nfo"
 	owned, err := canWriteJavBossNFO(nfoPath)
-	if err != nil {
-		return err
+	if err != nil && !errors.Is(err, errNFOUnownedByOtherTool) {
+		// Unreadable NFO: still try the cover, then surface the NFO problem.
+		if _, coverErr := writeJavPoster(ctx, base, item, coverDir, true, &result); coverErr != nil {
+			logging.Error("write JAV poster failed path=%s code=%s err=%v", videoPath, item.Code, coverErr)
+		}
+		return result, err
 	}
-	if err := writeNFOFile(nfoPath, makeJellyfinNFO(item)); err != nil {
-		return err
+	if errors.Is(err, errNFOUnownedByOtherTool) {
+		result.nfoPreserved = true
+	} else if err := writeNFOFile(nfoPath, makeJellyfinNFO(item)); err != nil {
+		if _, coverErr := writeJavPoster(ctx, base, item, coverDir, true, &result); coverErr != nil {
+			logging.Error("write JAV poster failed path=%s code=%s err=%v", videoPath, item.Code, coverErr)
+		}
+		return result, err
+	} else {
+		result.nfoWritten = true
 	}
 
-	if coverPath, ok := cover.FindPath(coverDir, item.Code); ok {
-		posterPath := base + "-poster" + strings.ToLower(filepath.Ext(coverPath))
-		if _, err := os.Stat(posterPath); err == nil && !owned {
-			return nil
-		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("inspect poster: %w", err)
-		}
-		if err := copyFileAtomically(coverPath, posterPath); err != nil {
-			return fmt.Errorf("write poster: %w", err)
-		}
-	} else {
-		cover.Enqueue(item.Code)
+	// Overwrite an existing poster only when JavBoss owns the accompanying NFO,
+	// which keeps the side effect limited to files we are allowed to manage.
+	if _, err := writeJavPoster(ctx, base, item, coverDir, result.nfoWritten || owned, &result); err != nil {
+		return result, err
 	}
-	return nil
+	return result, nil
+}
+
+// writeJavPoster copies the cached cover next to the video, fetching it first
+// when it is missing. It records the outcome on result rather than deciding
+// whether the run failed, because a pending cover is not an error.
+func writeJavPoster(
+	ctx context.Context,
+	base string,
+	item *models.Jav,
+	coverDir string,
+	overwrite bool,
+	result *sidecarResult,
+) (string, error) {
+	coverPath, ok := cover.FindPath(coverDir, item.Code)
+	if !ok {
+		if skipCoverWait(ctx) {
+			// 自动整理不在这里等下载：封面队列已经在后台拉取，
+			// 这里只把缺失项登记进队列，交给后续轮次补写。
+			// 未配置封面目录时队列未启动，登记会退化成空操作。
+			if cover.Enabled() {
+				cover.Enqueue(item.Code)
+			}
+		} else {
+			coverPath, ok = ensureCover(ctx, item.Code)
+		}
+	}
+	if !ok {
+		result.posterPending = true
+		return "", nil
+	}
+
+	posterPath := javPosterFileName(base, filepath.Ext(coverPath))
+	if _, err := os.Stat(posterPath); err == nil && !overwrite {
+		result.coverSkipped = true
+		// 即使跳过海报，也要补齐可能缺失的 fanart。
+		writeJavFanart(ctx, base, item, coverPath, result)
+		return posterPath, nil
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("inspect poster: %w", err)
+	}
+	if crop := posterCropFraction(); crop > 0 {
+		if cropped, err := writeCroppedPoster(coverPath, posterPath, crop); err == nil && cropped {
+			result.posterWritten = true
+			writeJavFanart(ctx, base, item, coverPath, result)
+			return posterPath, nil
+		} else if err != nil {
+			// 裁剪失败不阻断整理：回退为整图复制，保证媒体库至少有封面可用。
+			logging.Error("crop poster failed, fall back to full cover path=%s code=%s crop=%.2f err=%v", posterPath, item.Code, crop, err)
+		}
+	}
+	if err := copyFileAtomically(coverPath, posterPath); err != nil {
+		return "", fmt.Errorf("write poster: %w", err)
+	}
+	result.posterWritten = true
+	writeJavFanart(ctx, base, item, coverPath, result)
+	return posterPath, nil
+}
+
+// javPosterFileName 返回视频旁的海报路径，例如 /media/stars-182/stars-182.(mp4)-poster.jpg。
+// base 是去掉扩展名的视频路径。Emby 的 Primary 图片优先序列里 {name}-poster.ext 排在裸名
+// poster.ext 之前，且带名字的写法在一个目录放多部影片/多个版本时也不会互相覆盖。
+func javPosterFileName(base, coverExt string) string {
+	return base + posterSuffix + strings.ToLower(coverExt)
+}
+
+// javFanartFileName 返回视频旁的背景图路径，例如 /media/stars-182/stars-182.(mp4)-fanart.jpg。
+// Emby 把 {name}-fanart.ext 与 fanart.ext 同列为 Backdrop 候选，这里用带名字的写法。
+func javFanartFileName(base, coverExt string) string {
+	return base + fanartSuffix + strings.ToLower(coverExt)
+}
+
+// writeJavFanart 把未裁剪的原始封面写到视频旁作为 fanart（Emby 的背景图）。
+// fanart 与 poster 互补：poster 是裁掉左侧小图的竖版主图，fanart 保留整幅封套。
+// 两者同源——都从 coverDir 里的原始封面派生，fanart 是母版，poster 是它的右半部分，
+// 因此调大裁剪比例随时可以从 fanart 重新裁出海报，反之则不可逆。
+// 任何失败都只记录日志，不阻断整理流程。
+func writeJavFanart(ctx context.Context, base string, item *models.Jav, coverPath string, result *sidecarResult) {
+	if err := ctx.Err(); err != nil {
+		return
+	}
+	if !fanartEnabled() {
+		return
+	}
+	target := javFanartFileName(base, filepath.Ext(coverPath))
+	if info, err := os.Stat(target); err == nil && info.Size() > 0 {
+		// 已存在且非空，不重复覆盖，避免每次整理都重写大图。
+		return
+	}
+	if err := copyFileAtomically(coverPath, target); err != nil {
+		logging.Error("write JAV fanart failed path=%s code=%s err=%v", target, item.Code, err)
+		return
+	}
+	result.fanartWritten = true
+}
+
+// fanartEnabled 控制是否在视频旁写出 fanart。默认开启，可用环境变量关闭：
+//
+//	JAVBOSS_POSTER_FANART=0  不生成 fanart
+func fanartEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("JAVBOSS_POSTER_FANART"))) {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+// posterCropFraction 返回写入媒体库海报时要裁掉的左侧宽度占比。
+// JAV 封面多为 DVD 封套（左侧小图 + 右侧竖版主图），Emby/Jellyfin 的海报位
+// 需要的是右侧竖版主图，因此默认裁掉左侧 53%。环境变量可覆盖：
+//
+//	JAVBOSS_POSTER_CROP_LEFT=0     关闭裁剪，直接复制整张封面
+//	JAVBOSS_POSTER_CROP_LEFT=0.53  裁掉左侧 53%（默认）
+func posterCropFraction() float64 {
+	raw := strings.TrimSpace(os.Getenv("JAVBOSS_POSTER_CROP_LEFT"))
+	if raw == "" {
+		return defaultPosterCropLeft
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
+		return defaultPosterCropLeft
+	}
+	if value <= 0 {
+		return 0
+	}
+	if value >= maxPosterCropLeft {
+		return maxPosterCropLeft
+	}
+	return value
+}
+
+// writeCroppedPoster 把封面裁掉左侧 crop 比例后写成海报。
+// 返回 false 表示该格式不支持裁剪（调用方应回退为整图复制）。
+func writeCroppedPoster(coverPath, posterPath string, crop float64) (bool, error) {
+	src, err := os.Open(coverPath)
+	if err != nil {
+		return false, fmt.Errorf("open cover: %w", err)
+	}
+	defer src.Close()
+
+	img, format, err := image.Decode(src)
+	if err != nil {
+		return false, fmt.Errorf("decode cover: %w", err)
+	}
+	if format != "jpeg" && format != "png" {
+		return false, nil
+	}
+
+	bounds := img.Bounds()
+	width, height := bounds.Dx(), bounds.Dy()
+	if width <= 0 || height <= 0 {
+		return false, errors.New("cover has no pixels")
+	}
+	cut := int(math.Round(float64(width) * crop))
+	if cut <= 0 {
+		return false, nil
+	}
+	if cut >= width {
+		return false, fmt.Errorf("crop %.2f removes the whole cover", crop)
+	}
+
+	// 拷贝到 RGBA 再编码：SubImage 视图类型多样（YCbCr/Paletted/NRGBA…），
+	// 直接交给 jpeg.Encode 的路径不统一，先归一化到 RGBA 最稳。
+	rect := image.Rect(bounds.Min.X+cut, bounds.Min.Y, bounds.Max.X, bounds.Max.Y)
+	dst := image.NewRGBA(image.Rect(0, 0, rect.Dx(), rect.Dy()))
+	draw.Draw(dst, dst.Bounds(), img, rect.Min, draw.Src)
+
+	tmp := posterPath + ".tmp"
+	out, err := os.Create(tmp)
+	if err != nil {
+		return false, fmt.Errorf("create poster: %w", err)
+	}
+	encodeErr := jpeg.Encode(out, dst, &jpeg.Options{Quality: 92})
+	closeErr := out.Close()
+	if encodeErr != nil || closeErr != nil {
+		_ = os.Remove(tmp)
+		if encodeErr != nil {
+			return false, fmt.Errorf("encode poster: %w", encodeErr)
+		}
+		return false, fmt.Errorf("close poster: %w", closeErr)
+	}
+	if err := os.Rename(tmp, posterPath); err != nil {
+		_ = os.Remove(tmp)
+		return false, fmt.Errorf("commit poster: %w", err)
+	}
+	return true, nil
+}
+
+// ensureCover waits a bounded time for the cover of code to become available.
+// When downloads are disabled or the wait times out, it falls back to queueing
+// the download so a later run can complete the poster.
+func ensureCover(ctx context.Context, code string) (string, bool) {
+	waitCtx, cancel := context.WithTimeout(ctx, coverEnsureTimeout)
+	defer cancel()
+
+	path, err := cover.Ensure(waitCtx, code)
+	if err == nil {
+		return path, true
+	}
+	if !errors.Is(err, cover.ErrDownloadsDisabled) {
+		logging.Info("cover not available yet, queued for later: code=%s err=%v", code, err)
+	}
+	cover.Enqueue(code)
+	return "", false
 }
 
 func canWriteJavBossNFO(path string) (bool, error) {
@@ -914,7 +1246,7 @@ func canWriteJavBossNFO(path string) (bool, error) {
 		return false, fmt.Errorf("read existing NFO: %w", err)
 	}
 	if !strings.Contains(string(data), "<generator>JavBoss</generator>") {
-		return false, errors.New("existing NFO is not managed by JavBoss")
+		return false, errNFOUnownedByOtherTool
 	}
 	return true, nil
 }

@@ -1,0 +1,69 @@
+name: javboss
+
+# JavBoss 群晖 NAS 专用编排文件。
+# 与根目录 compose.local.yaml 的区别：
+#   1. 使用固定数据卷（/volume1/docker/javboss/data），升级不丢库；
+#   2. 用户与权限通过 PUID/PGID 注入，适配群晖的目录属主；
+#   3. 媒体目录路径在宿主机与容器内保持一致，STRM 里的本地路径可直接命中；
+#   4. 端口与路径全部来自同目录的 .env，脚本会自动生成。
+
+services:
+  javboss:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        BUILD_MODE: release
+        APP_VERSION: ${APP_VERSION:-strm-local}
+        NPM_CONFIG_REGISTRY: ${NPM_CONFIG_REGISTRY:-https://registry.npmmirror.com}
+        GOPROXY: ${GOPROXY:-https://goproxy.cn,direct}
+        GOSUMDB: ${GOSUMDB:-sum.golang.org}
+    image: javboss:${APP_VERSION:-strm-local}
+    container_name: javboss
+    user: "${PUID:-1000}:${PGID:-1000}"
+    ports:
+      - "${JAVBOSS_PORT:-17654}:17654"
+    command: ["./javboss", "-port", "17654"]
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      LANG: C.UTF-8
+      # 本方案把宿主机目录直挂到容器内同名路径（容器内路径 == 宿主机路径），
+      # 因此不需要 /host 前缀换算。设为 "1" 会让前端给每个路径拼上 /host，
+      # 导致目录选择器全部报"目录不存在或已不可用"。
+      JAVBOSS_HOST_PATH_PREFIX: "0"
+      JAVBOSS_PROXY_HOST_GATEWAY: "${JAVBOSS_PROXY_HOST_GATEWAY:-0}"
+      # 写媒体库海报时裁掉封面左侧的比例（JAV 封面左侧是 DVD 封套小图，
+      # Emby/Jellyfin 海报位需要右侧竖版主图）。设为 0 关闭裁剪、直接复制整图。
+      JAVBOSS_POSTER_CROP_LEFT: "${JAVBOSS_POSTER_CROP_LEFT:-0.53}"
+      # 是否在视频旁额外写出 <视频名>-fanart.jpg（Emby 背景图，保留整幅封面）。
+      # 图片全部带视频名（{name}-poster.jpg / {name}-fanart.jpg），不依赖"一片一目录"。
+      # 设为 0 只写 -poster.jpg。
+      JAVBOSS_POSTER_FANART: "${JAVBOSS_POSTER_FANART:-1}"
+      # 自动整理：扫描入库后自动补写 NFO 与封面，不需要再手动点"执行"。
+      #   sidecar                只写 NFO 和封面（默认，不移动任何视频文件）
+      #   organize               只按番号整理移动
+      #   organize_with_sidecar  整理并写 NFO 和封面
+      #   留空或 none            彻底关闭，同时让网页上的开关变灰
+      # 注意：这里只决定"用哪种方式整理"。平时开关请用
+      # 设置 → 目录 →「扫描后自动整理」，那一项存在数据库里，改完立即生效，
+      # 不需要重建容器。
+      JAVBOSS_AUTO_PROCESS: "${JAVBOSS_AUTO_PROCESS:-sidecar}"
+      # 首轮整理前等待封面队列排空的上限。封面是异步下载的，整库首次入库
+      # 下不完，因此默认 5 分钟后先写一轮（NFO 全量 + 已下好的封面），
+      # 剩下的由后台每隔几分钟补一轮，直到补齐。支持 "5m"、"300s" 或纯秒数；
+      # 零值按默认 5 分钟处理，负值表示完全不等封面。
+      JAVBOSS_AUTO_PROCESS_COVER_WAIT: "${JAVBOSS_AUTO_PROCESS_COVER_WAIT:-5m}"
+    volumes:
+      - type: bind
+        source: ${DATA_DIR:-/volume1/docker/javboss/data}
+        target: /app/data
+        bind:
+          create_host_path: true
+      # 媒体目录：容器内路径必须与 STRM 文件里写的本地路径一致，代理播放才能命中。
+      # 默认可写，因为生成 NFO / 封面和移动整理都需要写权限。
+      # 只想浏览、不允许改动源文件时，把下面 read_only 改成 true。
+      - type: bind
+        source: ${MEDIA_DIR:-/volume1/video}
+        target: ${MEDIA_DIR_IN_CONTAINER:-/volume1/video}
+        read_only: false
+    restart: unless-stopped

@@ -139,6 +139,31 @@ func TestExtractCodeFromName(t *testing.T) {
 	}
 }
 
+func TestExtractCodesFromStrmNames(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected []string
+	}{
+		// 用户实际命名：扩展名写在括号里，番号必须保持完整不被 (mkv) 干扰。
+		{input: "miaa-131.(mkv).strm", expected: []string{"MIAA-131"}},
+		{input: "MIAA-131.(MKV).strm", expected: []string{"MIAA-131"}},
+		{input: "ABP-123.strm", expected: []string{"ABP-123"}},
+		{input: "ABP-123.mp4.strm", expected: []string{"ABP-123"}},
+		{input: "ABP-123.strm.mp4", expected: []string{"ABP-123"}},
+		{input: "SNIS-974.(1080p).strm", expected: []string{"SNIS-974"}},
+		{input: "IPX-001.(h265).strm", expected: []string{"IPX-001"}},
+		{input: "SSIS-001.[4k].strm", expected: []string{"SSIS-001"}},
+		{input: "/volume1/video/JAV/MIAA-131.(mkv).strm", expected: []string{"MIAA-131"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			if got := util.ExtractCodeFromName(tt.input); !slices.Equal(got, tt.expected) {
+				t.Fatalf("ExtractCodeFromName(%q) = %#v, want %#v", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
 func TestExtractFC2PPVCodesFromName(t *testing.T) {
 	for _, tc := range []struct {
 		filename string

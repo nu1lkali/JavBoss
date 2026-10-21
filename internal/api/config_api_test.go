@@ -563,6 +563,75 @@ func TestWatchTimeIconMinutesPersistIndependently(t *testing.T) {
 	}
 }
 
+func TestUpdateConfigPersistsAutoProcessSwitch(t *testing.T) {
+	// 环境变量决定模式，没有它时开关会被判为不可用，这里固定成生产环境的默认值。
+	t.Setenv("JAVBOSS_AUTO_PROCESS", "sidecar")
+
+	deps := newTestDependencies()
+	gin.SetMode(gin.TestMode)
+	database, err := dbpkg.Open(filepath.Join(t.TempDir(), "config.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	sqlDB, err := database.DB()
+	if err != nil {
+		t.Fatalf("database handle: %v", err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+
+	deps.database = database
+	deps.bindDatabase(t)
+	router := gin.New()
+	router.PATCH("/config", updateConfig)
+	router.GET("/config", getConfig)
+
+	patch := func(body string) map[string]string {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPatch, "/config", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, req)
+		if response.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", response.Code, response.Body)
+		}
+		var cfg map[string]string
+		if err := json.Unmarshal(response.Body.Bytes(), &cfg); err != nil {
+			t.Fatal(err)
+		}
+		return cfg
+	}
+
+	// 显式关闭：配置表里必须留下 false，不能因为“默认跟随环境变量”又被当成开启。
+	if cfg := patch(`{"jav_auto_process_enabled":false}`); cfg["jav_auto_process_enabled"] != "false" {
+		t.Fatalf("enabled=%q, want false", cfg["jav_auto_process_enabled"])
+	}
+	stored, err := dbpkg.Default().ListConfig(context.Background())
+	if err != nil || stored["jav_auto_process_enabled"] != "false" {
+		t.Fatalf("stored enabled=%q err=%v", stored["jav_auto_process_enabled"], err)
+	}
+
+	// 再打开，并在 GET 里读回来。
+	if cfg := patch(`{"jav_auto_process_enabled":true}`); cfg["jav_auto_process_enabled"] != "true" {
+		t.Fatalf("enabled=%q, want true", cfg["jav_auto_process_enabled"])
+	}
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/config", nil))
+	var loaded map[string]string
+	if err := json.Unmarshal(response.Body.Bytes(), &loaded); err != nil {
+		t.Fatal(err)
+	}
+	if loaded["jav_auto_process_enabled"] != "true" {
+		t.Fatalf("loaded enabled=%q, want true", loaded["jav_auto_process_enabled"])
+	}
+	// mode / available 是运行时字段，始终有值，供设置页展示。
+	if _, ok := loaded["jav_auto_process_mode"]; !ok {
+		t.Fatal("jav_auto_process_mode should always be present")
+	}
+	if _, ok := loaded["jav_auto_process_available"]; !ok {
+		t.Fatal("jav_auto_process_available should always be present")
+	}
+}
+
 func TestBrowserResumePlaybackSettingPersists(t *testing.T) {
 	deps := newTestDependencies()
 	testAuthService(deps, t)
@@ -588,5 +657,104 @@ func TestBrowserResumePlaybackSettingPersists(t *testing.T) {
 				t.Fatalf("resume=%q, want %q", config["browser_player_resume_playback"], value)
 			}
 		})
+	}
+}
+
+func TestUpdateConfigPersistsEmbySettingsAndRedactsAPIKey(t *testing.T) {
+	deps := newTestDependencies()
+	gin.SetMode(gin.TestMode)
+	database, err := dbpkg.Open(filepath.Join(t.TempDir(), "config.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	sqlDB, err := database.DB()
+	if err != nil {
+		t.Fatalf("database handle: %v", err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+
+	deps.database = database
+	deps.bindDatabase(t)
+	router := gin.New()
+	router.PATCH("/config", updateConfig)
+	router.GET("/config", getConfig)
+
+	patch := func(body string) map[string]string {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPatch, "/config", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, req)
+		if response.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", response.Code, response.Body)
+		}
+		var cfg map[string]string
+		if err := json.Unmarshal(response.Body.Bytes(), &cfg); err != nil {
+			t.Fatal(err)
+		}
+		return cfg
+	}
+
+	const secret = "emby-secret-token"
+	cfg := patch(`{"jav_emby_enabled":true,"jav_emby_url":"http://192.168.1.10:8096","jav_emby_api_key":"` + secret + `"}`)
+	if cfg["jav_emby_enabled"] != "true" {
+		t.Fatalf("enabled=%q, want true", cfg["jav_emby_enabled"])
+	}
+	if cfg["jav_emby_url"] != "http://192.168.1.10:8096" {
+		t.Fatalf("url=%q, want normalized url", cfg["jav_emby_url"])
+	}
+	// 密钥明文绝不能出现在任何对外响应里。
+	if got, ok := cfg["jav_emby_api_key"]; ok {
+		t.Fatalf("api key must be redacted from response, got %q", got)
+	}
+	if cfg["jav_emby_api_key_set"] != "true" {
+		t.Fatalf("api_key_set=%q, want true", cfg["jav_emby_api_key_set"])
+	}
+	// 明文必须确实落库（否则通知 Emby 时无密钥可用）。
+	stored, err := dbpkg.Default().ListConfig(context.Background())
+	if err != nil || stored["jav_emby_api_key"] != secret {
+		t.Fatalf("stored api key=%q err=%v", stored["jav_emby_api_key"], err)
+	}
+
+	// 清空密钥：key_set 变回 false，明文从库里删掉。
+	if cfg := patch(`{"jav_emby_api_key":""}`); cfg["jav_emby_api_key_set"] != "false" {
+		t.Fatalf("api_key_set=%q after clearing, want false", cfg["jav_emby_api_key_set"])
+	}
+	stored, err = dbpkg.Default().ListConfig(context.Background())
+	if err != nil || stored["jav_emby_api_key"] != "" {
+		t.Fatalf("stored api key=%q after clearing, want empty", stored["jav_emby_api_key"])
+	}
+}
+
+func TestUpdateConfigRejectsInvalidEmbyURL(t *testing.T) {
+	deps := newTestDependencies()
+	gin.SetMode(gin.TestMode)
+	database, err := dbpkg.Open(filepath.Join(t.TempDir(), "config.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	sqlDB, err := database.DB()
+	if err != nil {
+		t.Fatalf("database handle: %v", err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+
+	deps.database = database
+	deps.bindDatabase(t)
+	router := gin.New()
+	router.PATCH("/config", updateConfig)
+
+	for _, body := range []string{
+		`{"jav_emby_url":"nas.local:8096"}`,
+		`{"jav_emby_url":"ftp://nas"}`,
+		`{"jav_emby_url":"/volume1/video"}`,
+	} {
+		req := httptest.NewRequest(http.MethodPatch, "/config", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, req)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("body=%s status=%d, want 400", body, response.Code)
+		}
 	}
 }

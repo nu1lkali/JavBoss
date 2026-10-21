@@ -36,6 +36,7 @@ var ErrUnavailable = errors.New("screenshot queue is unavailable")
 var ErrQueueFull = errors.New("screenshot queue is full")
 var ErrNoThumbnail = errors.New("video has no thumbnail timestamp")
 var errScreenshotStale = errors.New("screenshot task metadata is stale")
+var errStrmThumbnailUnsupported = errors.New("strm pointer has no video frames to capture")
 
 type screenshotKey struct {
 	videoID int64
@@ -193,6 +194,10 @@ func (m *queue) GetThumbnail(ctx context.Context, video *models.Video) (string, 
 	if !ok {
 		return "", errors.New("video has no valid screenshot task")
 	}
+	// STRM 没有可抓帧的本地内容，直接返回 ErrNoThumbnail 让上层回落到 JAV 封面。
+	if vpath, err := resolveVideoPath(video); err == nil && util.IsStrmFile(vpath) {
+		return "", ErrNoThumbnail
+	}
 	job, err := m.schedule(task, false)
 	if err != nil {
 		return "", err
@@ -301,6 +306,10 @@ func (m *queue) startWorker(ctx context.Context) {
 			}
 			err := processTask(ctx, m.dataDir, m.fetchVideo, job.task)
 			m.finish(job, err)
+			if errors.Is(err, errStrmThumbnailUnsupported) {
+				// 预期内情况：STRM 没有可抓取的帧，封面由 JAV 刮削提供。
+				continue
+			}
 			if err != nil {
 				logging.Error("screenshot task failed (video_id=%d, second=%d): %v", job.task.VideoID, job.task.Second, err)
 			}
@@ -340,6 +349,12 @@ func processTask(parent context.Context, dataDir string, fetchVideo videoFetcher
 	videoPath, err := resolveVideoPath(video)
 	if err != nil {
 		return err
+	}
+
+	// STRM 指针文件本身不含视频数据，mpv/ffmpeg 无法抓帧；
+	// 由 JAV 封面补位，避免每次扫描都重复入队失败。
+	if util.IsStrmFile(videoPath) {
+		return errStrmThumbnailUnsupported
 	}
 
 	info, err := os.Stat(videoPath)

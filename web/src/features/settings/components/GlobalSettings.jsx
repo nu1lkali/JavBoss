@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { useStore } from '@/store'
 import { useShallow } from 'zustand/react/shallow'
 import usePlaybackCapabilities from '@/features/playback/hooks/usePlaybackCapabilities'
@@ -5,7 +6,12 @@ import { useAuth } from '@/features/auth/hooks/useAuth'
 import { normalizeInitialViewMode, configFlag } from '@/utils/config'
 import GlobalSettingsModal from '@/features/settings/components/GlobalSettingsModal'
 import { zh } from '@/utils/i18n'
-import { processDirectory, scanDirectory } from '@/features/directories/api'
+import {
+  processDirectory,
+  scanDirectory,
+  rebuildNFO,
+  fetchNFORebuildStatus,
+} from '@/features/directories/api'
 import { updateConfig } from '@/features/settings/api'
 import { normalizeDefaultPlayer } from '@/features/playback/model'
 
@@ -35,6 +41,8 @@ export default function GlobalSettings({ onToast, open, onClose }) {
     defaultPlayer,
   } = usePlaybackCapabilities()
   const { changePassword, logout } = useAuth()
+  // NFO 重建的实时进度快照（轮询拿到的中间统计），传给弹窗画进度条。
+  const [nfoRebuildProgress, setNfoRebuildProgress] = useState(null)
   const initialViewMode = normalizeInitialViewMode(config?.initial_view_mode)
 
   return (
@@ -98,6 +106,45 @@ export default function GlobalSettings({ onToast, open, onClose }) {
       onSaveAllowLANAccess={async (enabled) => {
         const cfg = await updateConfig({ allow_lan_access: Boolean(enabled) })
         useStore.setState({ config: cfg })
+      }}
+      autoProcessEnabled={configFlag(config?.jav_auto_process_enabled)}
+      autoProcessAvailable={configFlag(config?.jav_auto_process_available, true)}
+      autoProcessMode={config?.jav_auto_process_mode || ''}
+      onSaveAutoProcessEnabled={async (enabled) => {
+        const cfg = await updateConfig({ jav_auto_process_enabled: Boolean(enabled) })
+        useStore.setState({ config: cfg })
+      }}
+      onRebuildNFO={async ({ directoryId = 0, dryRun }) => {
+        // 后台任务：启动后每 2 秒轮询一次，直到 running 变 false。
+        setNfoRebuildProgress(null)
+        await rebuildNFO({ directoryId, dryRun })
+        let status = null
+        const deadline = Date.now() + 30 * 60 * 1000
+        while (Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 2000))
+          status = await fetchNFORebuildStatus()
+          setNfoRebuildProgress(status?.summary || null)
+          if (!status?.running) break
+        }
+        setNfoRebuildProgress(null)
+        if (!dryRun) {
+          await loadDirectories()
+        }
+        if (status?.error) {
+          throw new Error(status.error)
+        }
+        return status?.summary || null
+      }}
+      nfoRebuildProgress={nfoRebuildProgress}
+      embyEnabled={configFlag(config?.jav_emby_enabled)}
+      embyURL={config?.jav_emby_url || ''}
+      embyAPIKeySet={configFlag(config?.jav_emby_api_key_set)}
+      onSaveEmbySettings={async (payload) => {
+        const cfg = await updateConfig(payload)
+        useStore.setState({ config: cfg })
+      }}
+      onTestEmbyConnection={async ({ url, apiKey }) => {
+        return testEmbyConnection({ url, apiKey })
       }}
       defaultPlayer={defaultPlayer}
       onSaveDefaultPlayer={async (player) => {

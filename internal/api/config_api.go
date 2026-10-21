@@ -1,10 +1,15 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"javboss/internal/common"
 	"javboss/internal/common/logging"
 	dbpkg "javboss/internal/db"
+	"javboss/internal/directory"
+	"javboss/internal/emby"
 	"javboss/internal/jav/scrape"
 	"javboss/internal/jav/translation"
 	"javboss/internal/mpv"
@@ -16,6 +21,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
@@ -138,6 +144,10 @@ func updateConfig(c *gin.Context) {
 		VideoWatchTimeIconMinutes *int                       `json:"video_watch_time_icon_minutes"`
 		JavWatchTimeIconMinutes   *int                       `json:"jav_watch_time_icon_minutes"`
 		BrowserResumePlayback     *bool                      `json:"browser_player_resume_playback"`
+		JavAutoProcessEnabled     *bool                      `json:"jav_auto_process_enabled"`
+		JavEmbyEnabled            *bool                      `json:"jav_emby_enabled"`
+		JavEmbyURL                *string                    `json:"jav_emby_url"`
+		JavEmbyAPIKey             *string                    `json:"jav_emby_api_key"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		respondLocalizedError(c, http.StatusBadRequest, "配置请求无效", "Invalid configuration request")
@@ -474,6 +484,30 @@ func updateConfig(c *gin.Context) {
 	if req.BrowserShowHotkeyHint != nil {
 		entries["browser_player_show_hotkey_hint"] = strconv.FormatBool(*req.BrowserShowHotkeyHint)
 	}
+	if req.JavAutoProcessEnabled != nil {
+		entries["jav_auto_process_enabled"] = strconv.FormatBool(*req.JavAutoProcessEnabled)
+	}
+	// Emby 联动：开关和地址即时保存；API Key 为空表示清除，不提供"不修改"语义——
+	// 前端对未改动的密钥不发送这个字段（nil）。
+	if req.JavEmbyEnabled != nil {
+		entries[emby.EnabledKey] = strconv.FormatBool(*req.JavEmbyEnabled)
+	}
+	if req.JavEmbyURL != nil {
+		raw := strings.TrimSpace(*req.JavEmbyURL)
+		if raw == "" {
+			entries[emby.URLKey] = ""
+		} else {
+			base := emby.NormalizeBaseURL(raw)
+			if err := emby.ValidateBaseURL(base); err != nil {
+				respondLocalizedError(c, http.StatusBadRequest, "Emby 地址无效，必须以 http:// 或 https:// 开头", "Invalid Emby server URL")
+				return
+			}
+			entries[emby.URLKey] = base
+		}
+	}
+	if req.JavEmbyAPIKey != nil {
+		entries[emby.APIKeyKey] = strings.TrimSpace(*req.JavEmbyAPIKey)
+	}
 	if req.PlayerHotkeys != nil {
 		clean := make([]playerHotkeyPayload, 0, len(req.PlayerHotkeys))
 		seen := make(map[string]struct{}, len(req.PlayerHotkeys))
@@ -598,6 +632,11 @@ func updateConfig(c *gin.Context) {
 		respondLocalizedError(c, http.StatusInternalServerError, "保存或应用配置失败", "Failed to save or apply configuration")
 		return
 	}
+	// 开关刚被打开：立刻评估存量目录，不必等到下一次扫描。
+	// 统计未整理项要遍历磁盘，所以放到后台，不拖慢这次保存请求。
+	if entries["jav_auto_process_enabled"] == "true" {
+		go directory.QueueAutoProcessForAll(directory.Context())
+	}
 	for _, domain := range []translation.Domain{{}, {Series: true}} {
 		if entries[domain.EnabledKey()] == "false" {
 			translation.StopBatch(domain.Series)
@@ -647,12 +686,52 @@ func updateConfig(c *gin.Context) {
 	c.JSON(http.StatusOK, cfg)
 }
 
+// testEmbyConnection 用刚填写的地址和密钥试连 Emby。
+// 允许前端传入"还没保存"的值，保存前就能自检。
+func testEmbyConnection(c *gin.Context) {
+	var req struct {
+		URL    string `json:"url"`
+		APIKey string `json:"api_key"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		respondLocalizedError(c, http.StatusBadRequest, "请求参数无效", "Invalid request payload")
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
+	defer cancel()
+	info, err := emby.TestConnection(ctx, req.URL, req.APIKey)
+	if err != nil {
+		logging.Info("emby test connection failed err=%v", err)
+		respondLocalizedError(c, http.StatusBadGateway, "连接 Emby 失败："+err.Error(), "Failed to reach the Emby server")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"server_name": info.ServerName,
+		"version":     info.Version,
+	})
+}
+
 func applyRuntimeConfigFields(cfg map[string]string, remoteAddr string) {
 	cfg["app_version"] = common.Version
 	translation.PublicConfig(cfg)
+	// Emby API Key 是敏感值：对外只暴露"是否已配置"，明文永不离开服务端。
+	emby.PublicConfig(cfg)
 	cfg["jav_title_translation_default_prompt"] = translation.DefaultPrompt
 	if strings.TrimSpace(cfg["jav_title_translation_prompt"]) == "" {
 		cfg["jav_title_translation_prompt"] = translation.DefaultPrompt
+	}
+	// 自动整理：模式来自环境变量（改它要重启容器），开关存在配置表里（改它即时生效）。
+	// available=false 表示环境变量层面就关掉了，网页上的开关此时只做展示、不可用。
+	autoProcessMode := common.AutoProcessMode()
+	cfg["jav_auto_process_mode"] = autoProcessMode
+	cfg["jav_auto_process_available"] = strconv.FormatBool(autoProcessMode != "")
+	switch {
+	case autoProcessMode == "":
+		// 环境变量已关闭：统一显示为关，避免出现“开关是开的却不起作用”。
+		cfg["jav_auto_process_enabled"] = "false"
+	case strings.TrimSpace(cfg["jav_auto_process_enabled"]) == "":
+		// 没有显式设置过：跟随环境变量，老库升级后不用先去设置页点一下。
+		cfg["jav_auto_process_enabled"] = "true"
 	}
 	cfg["proxy_mode"] = util.ResolveProxyMode(cfg["proxy_mode"], cfg["proxy_port"])
 	remoteRequest := isRemoteRequest(remoteAddr)

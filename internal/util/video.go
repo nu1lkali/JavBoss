@@ -72,7 +72,12 @@ func (m *VideoMetadata) FingerprintV2(size int64) string {
 // IsVideoCandidate reports whether a file should be passed to ffprobe for final
 // video-stream validation. Known video extensions are accepted as candidates so
 // uncommon or newer container signatures are not filtered out prematurely.
+// STRM pointer files are media entries as well, but their content is a URL, so
+// callers must branch on IsStrmFile before probing the file itself.
 func IsVideoCandidate(path string) bool {
+	if IsStrmFile(path) {
+		return true
+	}
 	if hasVideoExtension(filepath.Ext(path)) {
 		return true
 	}
@@ -204,6 +209,11 @@ var (
 // ContainerFFBinaryDir is the only location used for FFmpeg tools in Docker.
 const ContainerFFBinaryDir = "/app/internal/bin"
 
+// ContainerFFBinaryExePath is the fixed path of the FFmpeg binary inside the
+// image. The Dockerfile symlinks it to the system FFmpeg installed with the
+// distribution package manager, so it always resolves to the same file.
+func ContainerFFBinaryExePath() string { return ContainerFFBinaryDir + "/ffmpeg" }
+
 // ResolveFFprobePath resolves the ffprobe binary location.
 func ResolveFFprobePath() (string, error) {
 	ffprobeOnce.Do(func() {
@@ -253,11 +263,21 @@ func findFFBinaryPath(name string) (string, error) {
 func findFFBinaryPathWithLookup(name string, lookup func(string) (string, error)) (string, error) {
 	if common.ContainerMode() {
 		imagePath := ContainerFFBinaryDir + "/" + name
-		resolved, err := lookup(imagePath)
-		if err != nil {
-			return "", fmt.Errorf("%s unavailable in Docker image at %s: %w", name, imagePath, err)
+		var lastErr error
+		if resolved, err := lookup(imagePath); err == nil {
+			return resolved, nil
+		} else {
+			lastErr = err
 		}
-		return resolved, nil
+		// The image also symlinks ffmpeg into the executable directory, which is
+		// the same convention used by native release bundles.
+		if execPath, execErr := os.Executable(); execErr == nil {
+			bundledPath := filepath.Join(filepath.Dir(execPath), "internal", "bin", name)
+			if resolved, err := lookup(bundledPath); err == nil {
+				return resolved, nil
+			}
+		}
+		return "", fmt.Errorf("%s unavailable in Docker image at %s: %w", name, imagePath, lastErr)
 	}
 
 	var candidates []string

@@ -55,6 +55,11 @@ func RegisterRoutes(router gin.IRoutes) {
 	router.GET("/directories/browse", browseDirectories)
 	router.POST("/directories/:id/process", processDirectory)
 	router.POST("/directories/:id/scan", scanDirectory)
+	// 独立前缀，避免与 /directories/:id 的通配段冲突（gin 同一方法树里
+	// 静态段和 :id 通配段不能并存）。
+	router.POST("/nfo/rebuild", rebuildDirectoriesNFO)
+	router.GET("/nfo/rebuild", nfoRebuildStatus)
+	router.POST("/emby/test", testEmbyConnection)
 	router.PATCH("/directories/:id", updateDirectory)
 	router.GET("/tags", listTags)
 	router.POST("/tags", createTag)

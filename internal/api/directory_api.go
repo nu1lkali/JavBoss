@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"io"
 	"javboss/internal/common/logging"
 	dbpkg "javboss/internal/db"
 	"javboss/internal/directory"
@@ -74,11 +75,13 @@ func createDirectory(c *gin.Context) {
 	go func(created models.Directory) {
 		ctx := directory.Context()
 		if _, err := directory.ScanDirectory(ctx, created); err != nil {
-			if errors.Is(err, directory.ErrDirectoryScanInProgress) {
-				return
+			if !errors.Is(err, directory.ErrDirectoryScanInProgress) {
+				logging.Error("scan after create failed id=%d path=%s err=%v", created.ID, created.Path, err)
 			}
-			logging.Error("scan after create failed id=%d path=%s err=%v", created.ID, created.Path, err)
+			return
 		}
+		// 首次扫描同样要触发自动整理，否则新增目录必须手动点一次「执行」。
+		directory.QueueAutoProcess(created)
 	}(*dir)
 	c.JSON(http.StatusCreated, dir)
 }
@@ -172,11 +175,12 @@ func updateDirectory(c *gin.Context) {
 		}
 		ctx := directory.Context()
 		if _, err := directory.ScanDirectory(ctx, updated); err != nil {
-			if errors.Is(err, directory.ErrDirectoryScanInProgress) {
-				return
+			if !errors.Is(err, directory.ErrDirectoryScanInProgress) {
+				logging.Error("scan after update failed id=%d path=%s err=%v", updated.ID, updated.Path, err)
 			}
-			logging.Error("scan after update failed id=%d path=%s err=%v", updated.ID, updated.Path, err)
+			return
 		}
+		directory.QueueAutoProcess(updated)
 	}(*dir, shouldScan)
 	c.JSON(http.StatusOK, dir)
 }
@@ -264,4 +268,50 @@ func processDirectory(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusAccepted, gin.H{"work_status": directory.DirectoryWorkStatus(id)})
+}
+
+// rebuildDirectoriesNFO 在后台重写"空壳" NFO，立即返回任务状态。
+//
+// 只覆盖三类文件：缺失的、JavBoss 自己生成的、以及外部工具写的但没有正文
+// （plot/summary/outline/genre/actor 全空）的空壳。带剧情简介的外部 NFO 一律保留，
+// 所以可以放心对整库执行。dry_run=true 时只统计不写盘。
+//
+// 整库重建要遍历全部视频，远超 30 秒的写超时，因此必须是后台任务 + 前端轮询。
+func rebuildDirectoriesNFO(c *gin.Context) {
+	var req struct {
+		DirectoryID int64 `json:"directory_id"`
+		DryRun      bool  `json:"dry_run"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		respondLocalizedError(c, http.StatusBadRequest, "请求参数无效", "Invalid request payload")
+		return
+	}
+	if req.DirectoryID < 0 {
+		req.DirectoryID = 0
+	}
+
+	// 先校验目录存在，避免任务起来之后才发现参数不对。
+	if req.DirectoryID > 0 {
+		dir, err := dbpkg.Default().GetDirectory(c.Request.Context(), req.DirectoryID)
+		if err != nil {
+			logging.Error("load directory for NFO rebuild failed id=%d err=%v", req.DirectoryID, err)
+			respondLocalizedError(c, http.StatusInternalServerError, "读取目录失败", "Failed to load directory")
+			return
+		}
+		if dir == nil || dir.IsDelete {
+			respondLocalizedError(c, http.StatusNotFound, "目录不存在", "Directory does not exist")
+			return
+		}
+	}
+
+	if !directory.StartNFORebuild(req.DirectoryID, req.DryRun) {
+		respondLocalizedError(c, http.StatusConflict, "已有 NFO 重建任务正在执行", "An NFO rebuild job is already running")
+		return
+	}
+	c.JSON(http.StatusAccepted, directory.CurrentNFORebuildStatus())
+}
+
+// nfoRebuildStatus 返回 NFO 重建任务的当前进度，供前端轮询。
+func nfoRebuildStatus(c *gin.Context) {
+	c.JSON(http.StatusOK, directory.CurrentNFORebuildStatus())
 }
