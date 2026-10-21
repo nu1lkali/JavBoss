@@ -73,11 +73,18 @@ av/MIGD-641/
 建议如下结构，**媒体目录与数据目录分开**：
 
 ```
-/volume1/docker/javboss/data          <- 数据库、封面缓存（可写）
-/volume1/video                        <- 媒体库根目录（只读挂载）
+/volume1/docker/javboss-data         <- 数据库、封面缓存（可写）
+/volume1/docker/JavBoss              <- 项目源码（仓库目录，与数据目录分开）
+/volume1/video                       <- 媒体库根目录（只读挂载）
     └── JAV/
         └── miaa-131.(mkv).strm
 ```
+
+> **数据目录叫 `javboss-data`，不要改成和仓库目录只差大小写的名字**（如 `javboss`）。
+> 群晖的 ext4 大小写敏感，`javboss` 与 `JavBoss` 是两个能共存的目录，在 File Station 里
+> 却长得几乎一样，误删过数据目录。老部署的数据目录如果在 `/volume1/docker/javboss/data`，
+> 编辑 `deploy/synology/.env` 里的 `DATA_DIR` 指向新路径即可（脚本检测到旧默认目录不存在时
+> 也会自动改用新默认并写回 `.env`）。
 
 在 File Station 中对这两个目录右键 → 属性 → 权限，确认你的 DSM 账号有读写权限。
 
@@ -218,7 +225,7 @@ sudo -E docker build -t javboss:strm-local \
 若脚本提示 "数据目录不可写"，执行：
 
 ```bash
-sudo chown -R 1026:100 /volume1/docker/javboss/data
+sudo chown -R 1026:100 /volume1/docker/javboss-data
 ```
 
 `1026` 是群晖上常见的管理员 UID，可用 `id` 确认你自己的 UID。
@@ -442,6 +449,6 @@ curl -s -b "你的会话 cookie" http://127.0.0.1:17654/config |
 
 ## 九、升级与备份
 
-- **备份**：只需备份 `/volume1/docker/javboss/data`（SQLite 数据库 + 封面）
+- **备份**：只需备份 `/volume1/docker/javboss-data`（SQLite 数据库 + 封面）
 - **改了源码**：`sudo bash deploy-synology.sh --upgrade`（必须重新构建，`--no-build` 不会编译新代码）
 - **卸载**：`sudo docker compose down`（数据目录保留，手动删除才彻底清除）

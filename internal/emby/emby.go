@@ -9,6 +9,7 @@
 package emby
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -42,6 +43,12 @@ const notifyMinInterval = 10 * time.Minute
 
 // maxErrorBody 限制错误响应体进入日志/返回给前端的长度，避免把整个 HTML 错误页塞进去。
 const maxErrorBody = 200
+
+// maxJSONBody 是解析路径的响应体上限（8MB）：/System/Info、/Library/MediaFolders
+// 等接口的返回可能远超错误展示用的 maxErrorBody（比如 WakeOnLanInfo 列表很长），
+// 读取时必须用独立的宽限制，否则 JSON 被物理截断，Unmarshal 报
+// "unexpected end of JSON input"，被误判成"不是 Emby 服务"。
+const maxJSONBody = 8 << 20
 
 // Settings 是通知 Emby 所需的配置。
 type Settings struct {
@@ -114,12 +121,25 @@ func TestConnection(ctx context.Context, baseURL, apiKey string) (ServerInfo, er
 		return ServerInfo{}, err
 	}
 	var info systemInfoResponse
+	// 第一跳：/System/Info/Public 是 Emby 免认证的公共端点，先确认这个地址应答的
+	// 确实是 Emby。身份确认后，第二跳的失败才能被确定地归因为 API Key 问题，
+	// 而不是让用户怀疑地址填错。Public 端不可用（被反代禁用等）时不阻塞，
+	// 继续第二跳，保持对特殊部署的兼容。
+	var public systemInfoResponse
+	publicErr := getJSON(ctx, base+"/System/Info/Public", "", &public)
+	// 第二跳：带 API Key 的完整信息，同时验证密钥有效。
 	if err := getJSON(ctx, base+"/System/Info", key, &info); err != nil {
+		if publicErr == nil {
+			return ServerInfo{}, fmt.Errorf("已确认 %s 是 Emby 服务器（%s %s），但 API Key 认证失败：%v", base, public.ServerName, public.Version, err)
+		}
 		return ServerInfo{}, err
 	}
 	result := ServerInfo{
 		ServerName: strings.TrimSpace(info.ServerName),
 		Version:    strings.TrimSpace(info.Version),
+	}
+	if result.ServerName == "" {
+		result.ServerName = strings.TrimSpace(public.ServerName)
 	}
 	if result.ServerName == "" {
 		result.ServerName = base
@@ -247,7 +267,7 @@ func getJSON(ctx context.Context, url, apiKey string, out any) error {
 		return friendlyRequestError(url, err)
 	}
 	defer resp.Body.Close()
-	body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody*4))
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxJSONBody))
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return statusError(resp.StatusCode, string(body))
 	}
@@ -255,9 +275,51 @@ func getJSON(ctx context.Context, url, apiKey string, out any) error {
 		return fmt.Errorf("读取响应失败：%v", readErr)
 	}
 	if err := json.Unmarshal(body, out); err != nil {
-		return fmt.Errorf("响应不是有效的 JSON（%s 可能不是 Emby 服务）", url)
+		// body 触到读取上限说明是被截断了，不是服务不对——直说，别让人去怀疑端口。
+		if len(body) >= maxJSONBody {
+			return fmt.Errorf("Emby 响应体超过 %d 字节，无法完整解析（%s）", maxJSONBody, url)
+		}
+		return invalidJSONError(url, resp, body)
 	}
 	return nil
+}
+
+// invalidJSONError 把"2xx 但 body 不是 JSON"讲清楚：带上状态码、Content-Type 和
+// 一小段响应体，用户能直接看出这个地址应答的是什么服务。常见于 8096 被其他程序
+// 占用、反代返回登录页/重定向页、或地址填错。响应体片段不含密钥（密钥从不进 URL）。
+func invalidJSONError(url string, resp *http.Response, body []byte) error {
+	contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
+	snippet := strings.TrimSpace(string(body))
+	if len([]rune(snippet)) > maxErrorBody {
+		snippet = string([]rune(snippet)[:maxErrorBody]) + "…"
+	}
+	// Emby 的认证失败不走 401：AuthService 直接抛
+	// SecurityException("Access token is invalid or expired.")，响应是 2xx + 纯文本，
+	// 进不了 statusError 的 401 分支。按响应体文案识别，别误报成"不是 Emby 服务"。
+	if isEmbyAuthFailure(snippet) {
+		return errors.New("认证失败，请检查 API Key（Emby 返回：Access token is invalid or expired）")
+	}
+	if snippet == "" {
+		return fmt.Errorf("Emby 返回了空响应（HTTP %d，Content-Type: %s）：%s 可能不是 Emby 服务", resp.StatusCode, contentType, url)
+	}
+	if looksLikeHTML(contentType, body) {
+		return fmt.Errorf("地址 %s 返回的是网页（HTTP %d，Content-Type: %s），不是 Emby 接口：%s。该端口可能是其他服务、路由器管理页或需要登录的反向代理", url, resp.StatusCode, contentType, snippet)
+	}
+	return fmt.Errorf("响应不是有效的 JSON（HTTP %d，Content-Type: %s）：%s（%s 可能不是 Emby 服务）", resp.StatusCode, contentType, snippet, url)
+}
+
+// isEmbyAuthFailure 识别 Emby 的纯文本认证失败响应（状态码可能是 2xx）。
+func isEmbyAuthFailure(snippet string) bool {
+	return strings.Contains(strings.ToLower(snippet), "access token is invalid or expired")
+}
+
+// looksLikeHTML 判断响应体是否是网页：Content-Type 含 html，或 body 以 HTML 文档标签开头。
+func looksLikeHTML(contentType string, body []byte) bool {
+	if strings.Contains(strings.ToLower(contentType), "html") {
+		return true
+	}
+	trimmed := bytes.TrimSpace(body)
+	return bytes.HasPrefix(trimmed, []byte("<!doctype")) || bytes.HasPrefix(trimmed, []byte("<html"))
 }
 
 func postNoContent(ctx context.Context, url, apiKey string) error {

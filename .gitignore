@@ -2,6 +2,7 @@
 data/
 /cache/
 docker-data/
+javboss-data/
 *.db
 .DS_Store
 web/node_modules/

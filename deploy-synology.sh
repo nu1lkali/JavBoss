@@ -122,7 +122,16 @@ elif [ -n "$PORT" ]; then
   JAVBOSS_PORT="$PORT"
 fi
 
-DATA_DIR="${DATA_DIR:-/volume1/docker/javboss/data}"
+# 数据目录默认与仓库目录（/volume1/docker/JavBoss）平级，命名为 javboss-data：
+# 一眼能看出是数据目录，也不会再和仓库目录只差大小写（群晖 ext4 大小写敏感，
+# javboss 与 JavBoss 能同时存在，旧默认 /volume1/docker/javboss/data 就因此被误删过）。
+DATA_DIR="${DATA_DIR:-/volume1/docker/javboss-data}"
+# 老 .env 仍指向旧默认路径且该目录已不存在时，自动改用新默认并写回 .env，
+# 避免把数据又写回一个已被删除/混淆的路径；目录还在则维持原值，不动老部署。
+if [ "$DATA_DIR" = "/volume1/docker/javboss/data" ] && [ ! -d "$DATA_DIR" ]; then
+  warn "旧默认数据目录 $DATA_DIR 不存在，改用新默认 /volume1/docker/javboss-data"
+  DATA_DIR="/volume1/docker/javboss-data"
+fi
 APP_VERSION="${APP_VERSION:-strm-local}"
 TZ="${TZ:-Asia/Shanghai}"
 

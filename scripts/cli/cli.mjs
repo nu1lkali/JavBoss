@@ -1482,7 +1482,7 @@ stop 停止容器，保留容器和数据。
 环境变量：
   JAVBOSS_DOCKER_IMAGE     镜像名称（默认 javboss:local）
   JAVBOSS_DOCKER_PORT      宿主机端口（默认 5174）
-  JAVBOSS_DOCKER_DATA_DIR  数据目录（默认仓库下 docker-data）
+  JAVBOSS_DOCKER_DATA_DIR  数据目录（默认仓库下 javboss-data）
   JAVBOSS_DOCKER_UID       容器用户 ID（默认当前用户，必须非 0）
   JAVBOSS_DOCKER_GID       容器组 ID（默认当前用户的主组）`);
     return;
@@ -1533,7 +1533,13 @@ stop 停止容器，保留容器和数据。
       || !/^\d+$/.test(gid) || Number(gid) > 4294967294) {
     throw new Error("[docker] 请使用有效的非 root UID 和 GID；不要以 root 用户启动脚本，或设置 JAVBOSS_DOCKER_UID/JAVBOSS_DOCKER_GID");
   }
-  const dataDir = path.resolve(ROOT_DIR, process.env.JAVBOSS_DOCKER_DATA_DIR || "docker-data");
+  // 数据目录默认名为 javboss-data（一眼可辨是数据目录）。兼容旧默认 docker-data：
+  // 老仓库里已有 docker-data 且还没有 javboss-data 时继续用它，避免升级后换目录丢库。
+  const dataDir = process.env.JAVBOSS_DOCKER_DATA_DIR
+    ? path.resolve(ROOT_DIR, process.env.JAVBOSS_DOCKER_DATA_DIR)
+    : (fs.existsSync(path.join(ROOT_DIR, "docker-data")) && !fs.existsSync(path.join(ROOT_DIR, "javboss-data"))
+      ? path.join(ROOT_DIR, "docker-data")
+      : path.join(ROOT_DIR, "javboss-data"));
   const dockerOptions = {
     cwd: ROOT_DIR,
     env: {
