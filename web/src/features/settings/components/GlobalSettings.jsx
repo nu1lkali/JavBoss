@@ -11,6 +11,7 @@ import {
   scanDirectory,
   rebuildNFO,
   fetchNFORebuildStatus,
+  testEmbyConnection,
 } from '@/features/directories/api'
 import { updateConfig } from '@/features/settings/api'
 import { normalizeDefaultPlayer } from '@/features/playback/model'
