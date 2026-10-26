@@ -541,8 +541,8 @@ var javSidecarImageExts = []string{".jpg", ".jpeg", ".png", ".webp"}
 // 空 NFO 视为残缺（只是占位），仍交给整理流程补写。
 //
 // 注意：这里只管"文件在不在"，不比对裁剪参数。改了 JAVBOSS_POSTER_CROP_LEFT
-// 之后已就绪的目录不会自动重排，需要手动点一次「整理」；海报尺寸与当前裁剪比例
-// 不符时 posterUpToDate 会判定为过期并重裁，所以手动整理一次即可收敛。
+// 之后已就绪的目录不会自动重排：海报一旦存在就不再重写（避免整理反复跑时
+// 无谓地刷新 mtime）。想用新比例重生成，删掉该条目的海报后再整理一次。
 func javSidecarComplete(videoPath string, requirePoster bool) bool {
 	base := strings.TrimSuffix(videoPath, filepath.Ext(videoPath))
 	info, err := os.Stat(base + ".nfo")

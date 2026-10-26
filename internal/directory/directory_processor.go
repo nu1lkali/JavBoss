@@ -1007,22 +1007,22 @@ func writeJavSidecars(ctx context.Context, videoPath string, item *models.Jav, c
 
 	base := strings.TrimSuffix(videoPath, filepath.Ext(videoPath))
 	nfoPath := base + ".nfo"
-	owned, err := canWriteJavBossNFO(nfoPath)
-	if err != nil && !errors.Is(err, errNFOUnownedByOtherTool) {
+	_, nfoErr := canWriteJavBossNFO(nfoPath)
+	if nfoErr != nil && !errors.Is(nfoErr, errNFOUnownedByOtherTool) {
 		// Unreadable NFO: still try the cover, then surface the NFO problem.
-		if _, coverErr := writeJavPoster(ctx, base, item, coverDir, true, &result); coverErr != nil {
+		if _, coverErr := writeJavPoster(ctx, base, item, coverDir, &result); coverErr != nil {
 			logging.Error("write JAV poster failed path=%s code=%s err=%v", videoPath, item.Code, coverErr)
 		}
-		return result, err
+		return result, nfoErr
 	}
-	if errors.Is(err, errNFOUnownedByOtherTool) {
+	if errors.Is(nfoErr, errNFOUnownedByOtherTool) {
 		result.nfoPreserved = true
 	} else {
 		// 内容没变就不落盘：整理会把整个目录重跑一遍，
 		// 无条件重写只会把 NFO 的 mtime 刷成当天，对用户没有任何收益。
 		written, writeErr := writeNFOIfChanged(nfoPath, makeJellyfinNFO(item))
 		if writeErr != nil {
-			if _, coverErr := writeJavPoster(ctx, base, item, coverDir, true, &result); coverErr != nil {
+			if _, coverErr := writeJavPoster(ctx, base, item, coverDir, &result); coverErr != nil {
 				logging.Error("write JAV poster failed path=%s code=%s err=%v", videoPath, item.Code, coverErr)
 			}
 			return result, writeErr
@@ -1030,11 +1030,8 @@ func writeJavSidecars(ctx context.Context, videoPath string, item *models.Jav, c
 		result.nfoWritten = written
 	}
 
-	// Overwrite an existing poster only when JavBoss owns the accompanying NFO,
-	// which keeps the side effect limited to files we are allowed to manage.
-	// 注意 overwrite 只表示"允许覆盖"，真正要不要写由 writeJavPoster 里的
-	// posterUpToDate 判定，因此内容没变时不会刷新 mtime。
-	if _, err := writeJavPoster(ctx, base, item, coverDir, result.nfoWritten || owned, &result); err != nil {
+	// 海报只在缺失时生成，已存在就原样保留（详见 writeJavPoster 的说明）。
+	if _, err := writeJavPoster(ctx, base, item, coverDir, &result); err != nil {
 		return result, err
 	}
 	return result, nil
@@ -1043,12 +1040,17 @@ func writeJavSidecars(ctx context.Context, videoPath string, item *models.Jav, c
 // writeJavPoster copies the cached cover next to the video, fetching it first
 // when it is missing. It records the outcome on result rather than deciding
 // whether the run failed, because a pending cover is not an error.
+//
+// 海报一旦存在就原样保留：不看 mtime，也不看裁剪比例和封面尺寸。
+// 封面缓存常被外部改写（重新下载、rsync、备份还原、快照回滚），裁剪比例也
+// 可能在配置里调整；只要让这些因素参与"要不要重写"，整理每跑一轮就会把海报
+// 重新解码编码一次，用户看到的就是"什么都没变，海报日期却是今天"。
+// 想换封面，删掉海报再整理一次即可。
 func writeJavPoster(
 	ctx context.Context,
 	base string,
 	item *models.Jav,
 	coverDir string,
-	overwrite bool,
 	result *sidecarResult,
 ) (string, error) {
 	coverPath, ok := cover.FindPath(coverDir, item.Code)
@@ -1071,20 +1073,13 @@ func writeJavPoster(
 
 	posterPath := javPosterFileName(base, filepath.Ext(coverPath))
 	info, statErr := os.Stat(posterPath)
-	hasPoster := statErr == nil && info.Size() > 0
 	switch {
 	case statErr != nil && !errors.Is(statErr, os.ErrNotExist):
 		return "", fmt.Errorf("inspect poster: %w", statErr)
-	case hasPoster && !overwrite:
-		// 这张海报属于别的工具（NFO 也不是 JavBoss 写的）：只接受现状，不改别人的图。
+	case statErr == nil && info.Size() > 0:
+		// 已有海报：本轮无事可做。
 		result.coverSkipped = true
 		// 即使跳过海报，也要补齐可能缺失的 fanart。
-		writeJavFanart(ctx, base, item, coverPath, result)
-		return posterPath, nil
-	case hasPoster && posterUpToDate(coverPath, posterPath):
-		// 已存在，且尺寸与「当前封面 + 当前裁剪比例」一致、封面也没更新：
-		// 说明本轮无事可做，直接返回，避免重新解码编码把 mtime 刷成当天。
-		result.coverSkipped = true
 		writeJavFanart(ctx, base, item, coverPath, result)
 		return posterPath, nil
 	}
@@ -1098,13 +1093,7 @@ func writeJavPoster(
 			logging.Error("crop poster failed, fall back to full cover path=%s code=%s crop=%.2f err=%v", posterPath, item.Code, crop, err)
 		}
 	}
-	// 走到这里说明要么关闭了裁剪、要么裁剪不适用（非 jpeg/png 等）：
-	// 整图复制也是纯派生文件，尺寸与 mtime 一致就说明已经有同一份了。
-	if sidecarFileUpToDate(coverPath, posterPath) {
-		result.coverSkipped = true
-		writeJavFanart(ctx, base, item, coverPath, result)
-		return posterPath, nil
-	}
+	// 走到这里说明海报缺失（或为空文件）：直接生成，不看封面是否"更新过"。
 	if err := copyFileAtomically(coverPath, posterPath); err != nil {
 		return "", fmt.Errorf("write poster: %w", err)
 	}
@@ -1128,9 +1117,8 @@ func javFanartFileName(base, coverExt string) string {
 
 // writeJavFanart 把未裁剪的原始封面写到视频旁作为 fanart（Emby 的背景图）。
 // fanart 与 poster 互补：poster 是裁掉左侧小图的竖版主图，fanart 保留整幅封套。
-// 两者同源——都从 coverDir 里的原始封面派生，fanart 是母版，poster 是它的右半部分，
-// 因此调大裁剪比例随时可以从 fanart 重新裁出海报，反之则不可逆。
-// 任何失败都只记录日志，不阻断整理流程。
+// 两者都是"写一次就冻结"的派生文件：缺失（或为空文件）才补写，已存在一律不动。
+// 想换封套，删掉这个文件再整理一次即可。任何失败都只记录日志，不阻断整理流程。
 func writeJavFanart(ctx context.Context, base string, item *models.Jav, coverPath string, result *sidecarResult) {
 	if err := ctx.Err(); err != nil {
 		return
@@ -1140,13 +1128,12 @@ func writeJavFanart(ctx context.Context, base string, item *models.Jav, coverPat
 	}
 	target := javFanartFileName(base, filepath.Ext(coverPath))
 	if info, err := os.Stat(target); err == nil && info.Size() > 0 {
-		// 已存在且非空：只有封面比 fanart 更新时才重写。
-		// 这样既不每轮重刷大图，也不会让背景图永远停在旧封面上。
-		coverInfo, statErr := os.Stat(coverPath)
-		if statErr != nil || !coverInfo.ModTime().After(info.ModTime()) {
-			return
-		}
-		logging.Info("fanart refreshed after cover update path=%s code=%s", target, item.Code)
+		// 已存在且非空：不重写。
+		//
+		// 这里不看 mtime，也不比对封面：封面缓存会被重新下载、被 rsync 同步、
+		// 被备份还原，时间戳天天变，用它判断"过期"就会让整理每跑一轮都重写
+		// fanart，用户看到的就是"NFO 没变，fanart 的日期却是今天"。
+		return
 	}
 	if err := copyFileAtomically(coverPath, target); err != nil {
 		logging.Error("write JAV fanart failed path=%s code=%s err=%v", target, item.Code, err)
@@ -1193,7 +1180,7 @@ func posterCropFraction() float64 {
 
 // writeCroppedPoster 把封面裁掉左侧 crop 比例后写成海报。
 // 返回 false 表示该格式不支持裁剪（调用方应回退为整图复制）。
-// 是否真的需要裁由 writeJavPoster 的 posterUpToDate 先判定，这里只管执行。
+// 只在海报缺失时才会被调用，已存在的海报不会被覆盖，所以这里只管执行。
 func writeCroppedPoster(coverPath, posterPath string, crop float64) (bool, error) {
 	src, err := os.Open(coverPath)
 	if err != nil {
@@ -1393,80 +1380,6 @@ func equalUnorderedActors(left, right []jellyfinActor) bool {
 		rightNames = append(rightNames, actor.Name)
 	}
 	return equalUnorderedStrings(leftNames, rightNames)
-}
-
-// sidecarFileUpToDate 判断「由 source 原样复制出来的 target」是否已经是最新的：
-// 尺寸相同且 target 不比 source 旧。纯 stat 判定，不读文件内容。
-func sidecarFileUpToDate(sourcePath, targetPath string) bool {
-	source, err := os.Stat(sourcePath)
-	if err != nil || !source.Mode().IsRegular() || source.Size() == 0 {
-		return false
-	}
-	target, err := os.Stat(targetPath)
-	if err != nil || target.Size() != source.Size() {
-		return false
-	}
-	return !target.ModTime().Before(source.ModTime())
-}
-
-// posterUpToDate 报告现有海报是否已经是「当前封面 + 当前裁剪比例」的产物。
-//
-// 判定只看文件属性与图片头，不把像素解出来、更不重新编码：
-//   - 尺寸比对：封面被我方更新过、或裁剪比例改过，尺寸就不再匹配；
-//   - mtime 比对：封面被重新下载后，旧海报必须重裁。
-//
-// 因此每个条目的开销是 2 次 stat + 1 次图片头读取（几十字节），
-// 真正的解码/编码只在判定为过期之后才发生。
-func posterUpToDate(coverPath, posterPath string) bool {
-	coverInfo, err := os.Stat(coverPath)
-	if err != nil || !coverInfo.Mode().IsRegular() {
-		return false
-	}
-	posterInfo, err := os.Stat(posterPath)
-	if err != nil || posterInfo.Size() <= 0 {
-		return false
-	}
-	if posterInfo.ModTime().Before(coverInfo.ModTime()) {
-		return false
-	}
-	wantWidth, wantHeight, ok := expectedPosterDimensions(coverPath, posterCropFraction())
-	if !ok {
-		return false
-	}
-	gotWidth, gotHeight, ok := imageDimensions(posterPath)
-	if !ok {
-		return false
-	}
-	return wantWidth == gotWidth && wantHeight == gotHeight
-}
-
-// expectedPosterDimensions 预测写出的海报尺寸，判定规则与 writeCroppedPoster 保持一致。
-func expectedPosterDimensions(coverPath string, crop float64) (int, int, bool) {
-	file, err := os.Open(coverPath)
-	if err != nil {
-		return 0, 0, false
-	}
-	defer file.Close()
-	config, format, err := image.DecodeConfig(file)
-	if err != nil {
-		return 0, 0, false
-	}
-	width, height := config.Width, config.Height
-	if width <= 0 || height <= 0 {
-		return 0, 0, false
-	}
-	// 下面这些分支都会回退成"整图复制"，预期尺寸就是封面原尺寸。
-	if format != "jpeg" && format != "png" {
-		return width, height, true
-	}
-	if crop <= 0 {
-		return width, height, true
-	}
-	cut := int(math.Round(float64(width) * crop))
-	if cut <= 0 || cut >= width {
-		return width, height, true
-	}
-	return width - cut, height, true
 }
 
 func imageDimensions(path string) (int, int, bool) {
