@@ -1,0 +1,41 @@
+# 统一换行规范：仓库内文本文件一律以 LF 存储与检出。
+# 原因：Windows 侧 core.autocrlf=true 曾把 shell 脚本写成 CRLF，
+# 导致 Linux/Synology 上 bash 报 $'\r': command not found。
+* text=auto eol=lf
+
+*.sh        text eol=lf
+*.bash      text eol=lf
+*.zsh       text eol=lf
+Dockerfile  text eol=lf
+*.yaml      text eol=lf
+*.yml       text eol=lf
+*.go        text eol=lf
+*.js        text eol=lf
+*.jsx       text eol=lf
+*.mjs       text eol=lf
+*.cjs       text eol=lf
+*.css       text eol=lf
+*.json      text eol=lf
+*.md        text eol=lf
+*.lua       text eol=lf
+*.conf      text eol=lf
+
+# Windows 专用脚本与资源脚本保留 CRLF
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+*.ps1       text eol=crlf
+*.rc        text eol=crlf
+
+# 二进制资源不做换行转换
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary
+*.ttf       binary
+*.woff      binary
+*.woff2     binary
+*.syso      binary
+*.mp4       binary
+*.zip       binary
+*.pb        binary
