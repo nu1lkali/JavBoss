@@ -441,6 +441,99 @@ func TestWriteJavSidecarsReportsPendingCoverWhenDownloadsDisabled(t *testing.T) 
 	}
 }
 
+// TestWriteJavSidecarsSkipsUnchangedSidecars 锁定"整理重复跑不会改动已就绪文件"的契约：
+// 自动整理会把整个目录反复过一遍，任何一次无意义的写入都会把 NFO/封面的 mtime
+// 刷成当天，在 Emby/Jellyfin 侧看起来就像"又刮削了一次"。
+func TestWriteJavSidecarsSkipsUnchangedSidecars(t *testing.T) {
+	root := t.TempDir()
+	coverDir := t.TempDir()
+	videoPath := filepath.Join(root, "IPX-001.mp4")
+	writeTestFile(t, videoPath, []byte("video"))
+	writeTestJPEG(t, filepath.Join(coverDir, "ipx-001.jpg"), 200, 300)
+	item := &models.Jav{Code: "IPX-001", Title: "Sample Title"}
+
+	first, err := writeJavSidecars(t.Context(), videoPath, item, coverDir)
+	if err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	if !first.nfoWritten || !first.posterWritten {
+		t.Fatalf("first run result = %+v, want NFO and poster written", first)
+	}
+
+	nfoPath := filepath.Join(root, "IPX-001.nfo")
+	posterPath := filepath.Join(root, "IPX-001-poster.jpg")
+	fanartPath := filepath.Join(root, "IPX-001-fanart.jpg")
+	nfoBefore := modTimeOf(t, nfoPath)
+	posterBefore := modTimeOf(t, posterPath)
+	fanartBefore := modTimeOf(t, fanartPath)
+
+	// 留出 mtime 变化的可能，这样"没变"才是有意义的断言。
+	time.Sleep(20 * time.Millisecond)
+
+	second, err := writeJavSidecars(t.Context(), videoPath, item, coverDir)
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if second.changed() {
+		t.Fatalf("second run result = %+v, want no file changes", second)
+	}
+	if !second.coverSkipped {
+		t.Fatalf("second run result = %+v, want the poster reported as skipped", second)
+	}
+	if got := modTimeOf(t, nfoPath); !got.Equal(nfoBefore) {
+		t.Fatalf("NFO was rewritten: %v -> %v", nfoBefore, got)
+	}
+	if got := modTimeOf(t, posterPath); !got.Equal(posterBefore) {
+		t.Fatalf("poster was rewritten: %v -> %v", posterBefore, got)
+	}
+	if got := modTimeOf(t, fanartPath); !got.Equal(fanartBefore) {
+		t.Fatalf("fanart was rewritten: %v -> %v", fanartBefore, got)
+	}
+}
+
+// TestWriteJavSidecarsRecropsWhenCoverChanges 确认"跳过"不会变成"永不更新"：
+// 封面被换掉（内容与尺寸都变）后，海报必须重裁。
+func TestWriteJavSidecarsRecropsWhenCoverChanges(t *testing.T) {
+	root := t.TempDir()
+	coverDir := t.TempDir()
+	videoPath := filepath.Join(root, "IPX-002.mp4")
+	writeTestFile(t, videoPath, []byte("video"))
+	coverPath := filepath.Join(coverDir, "ipx-002.jpg")
+	writeTestJPEG(t, coverPath, 200, 300)
+	item := &models.Jav{Code: "IPX-002"}
+
+	if _, err := writeJavSidecars(t.Context(), videoPath, item, coverDir); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+
+	// 换成更宽的封面：200 -> 400，裁剪后应为 400-212=188 宽。
+	time.Sleep(20 * time.Millisecond)
+	writeTestJPEG(t, coverPath, 400, 300)
+	result, err := writeJavSidecars(t.Context(), videoPath, item, coverDir)
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if !result.posterWritten || result.nfoWritten {
+		t.Fatalf("result = %+v, want only the poster rewritten", result)
+	}
+	width, height, ok := imageDimensions(filepath.Join(root, "IPX-002-poster.jpg"))
+	if !ok {
+		t.Fatal("poster is not a readable image")
+	}
+	if width != 188 || height != 300 {
+		t.Fatalf("poster size = %dx%d, want 188x300 after the cover changed", width, height)
+	}
+}
+
+func modTimeOf(t *testing.T, path string) time.Time {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	return info.ModTime()
+}
+
 func TestMoveMediaGroupSkipsExistingTargetWithoutChangingSource(t *testing.T) {
 	root := t.TempDir()
 	source := filepath.Join(root, "incoming", "same.mp4")

@@ -1,6 +1,7 @@
 package directory
 
 import (
+	"bytes"
 	"context"
 	"encoding/xml"
 	"errors"
@@ -1016,17 +1017,23 @@ func writeJavSidecars(ctx context.Context, videoPath string, item *models.Jav, c
 	}
 	if errors.Is(err, errNFOUnownedByOtherTool) {
 		result.nfoPreserved = true
-	} else if err := writeNFOFile(nfoPath, makeJellyfinNFO(item)); err != nil {
-		if _, coverErr := writeJavPoster(ctx, base, item, coverDir, true, &result); coverErr != nil {
-			logging.Error("write JAV poster failed path=%s code=%s err=%v", videoPath, item.Code, coverErr)
-		}
-		return result, err
 	} else {
-		result.nfoWritten = true
+		// 内容没变就不落盘：整理会把整个目录重跑一遍，
+		// 无条件重写只会把 NFO 的 mtime 刷成当天，对用户没有任何收益。
+		written, writeErr := writeNFOIfChanged(nfoPath, makeJellyfinNFO(item))
+		if writeErr != nil {
+			if _, coverErr := writeJavPoster(ctx, base, item, coverDir, true, &result); coverErr != nil {
+				logging.Error("write JAV poster failed path=%s code=%s err=%v", videoPath, item.Code, coverErr)
+			}
+			return result, writeErr
+		}
+		result.nfoWritten = written
 	}
 
 	// Overwrite an existing poster only when JavBoss owns the accompanying NFO,
 	// which keeps the side effect limited to files we are allowed to manage.
+	// 注意 overwrite 只表示"允许覆盖"，真正要不要写由 writeJavPoster 里的
+	// posterUpToDate 判定，因此内容没变时不会刷新 mtime。
 	if _, err := writeJavPoster(ctx, base, item, coverDir, result.nfoWritten || owned, &result); err != nil {
 		return result, err
 	}
@@ -1063,13 +1070,23 @@ func writeJavPoster(
 	}
 
 	posterPath := javPosterFileName(base, filepath.Ext(coverPath))
-	if _, err := os.Stat(posterPath); err == nil && !overwrite {
+	info, statErr := os.Stat(posterPath)
+	hasPoster := statErr == nil && info.Size() > 0
+	switch {
+	case statErr != nil && !errors.Is(statErr, os.ErrNotExist):
+		return "", fmt.Errorf("inspect poster: %w", statErr)
+	case hasPoster && !overwrite:
+		// 这张海报属于别的工具（NFO 也不是 JavBoss 写的）：只接受现状，不改别人的图。
 		result.coverSkipped = true
 		// 即使跳过海报，也要补齐可能缺失的 fanart。
 		writeJavFanart(ctx, base, item, coverPath, result)
 		return posterPath, nil
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return "", fmt.Errorf("inspect poster: %w", err)
+	case hasPoster && posterUpToDate(coverPath, posterPath):
+		// 已存在，且尺寸与「当前封面 + 当前裁剪比例」一致、封面也没更新：
+		// 说明本轮无事可做，直接返回，避免重新解码编码把 mtime 刷成当天。
+		result.coverSkipped = true
+		writeJavFanart(ctx, base, item, coverPath, result)
+		return posterPath, nil
 	}
 	if crop := posterCropFraction(); crop > 0 {
 		if cropped, err := writeCroppedPoster(coverPath, posterPath, crop); err == nil && cropped {
@@ -1080,6 +1097,13 @@ func writeJavPoster(
 			// 裁剪失败不阻断整理：回退为整图复制，保证媒体库至少有封面可用。
 			logging.Error("crop poster failed, fall back to full cover path=%s code=%s crop=%.2f err=%v", posterPath, item.Code, crop, err)
 		}
+	}
+	// 走到这里说明要么关闭了裁剪、要么裁剪不适用（非 jpeg/png 等）：
+	// 整图复制也是纯派生文件，尺寸与 mtime 一致就说明已经有同一份了。
+	if sidecarFileUpToDate(coverPath, posterPath) {
+		result.coverSkipped = true
+		writeJavFanart(ctx, base, item, coverPath, result)
+		return posterPath, nil
 	}
 	if err := copyFileAtomically(coverPath, posterPath); err != nil {
 		return "", fmt.Errorf("write poster: %w", err)
@@ -1116,8 +1140,13 @@ func writeJavFanart(ctx context.Context, base string, item *models.Jav, coverPat
 	}
 	target := javFanartFileName(base, filepath.Ext(coverPath))
 	if info, err := os.Stat(target); err == nil && info.Size() > 0 {
-		// 已存在且非空，不重复覆盖，避免每次整理都重写大图。
-		return
+		// 已存在且非空：只有封面比 fanart 更新时才重写。
+		// 这样既不每轮重刷大图，也不会让背景图永远停在旧封面上。
+		coverInfo, statErr := os.Stat(coverPath)
+		if statErr != nil || !coverInfo.ModTime().After(info.ModTime()) {
+			return
+		}
+		logging.Info("fanart refreshed after cover update path=%s code=%s", target, item.Code)
 	}
 	if err := copyFileAtomically(coverPath, target); err != nil {
 		logging.Error("write JAV fanart failed path=%s code=%s err=%v", target, item.Code, err)
@@ -1164,6 +1193,7 @@ func posterCropFraction() float64 {
 
 // writeCroppedPoster 把封面裁掉左侧 crop 比例后写成海报。
 // 返回 false 表示该格式不支持裁剪（调用方应回退为整图复制）。
+// 是否真的需要裁由 writeJavPoster 的 posterUpToDate 先判定，这里只管执行。
 func writeCroppedPoster(coverPath, posterPath string, crop float64) (bool, error) {
 	src, err := os.Open(coverPath)
 	if err != nil {
@@ -1251,18 +1281,208 @@ func canWriteJavBossNFO(path string) (bool, error) {
 	return true, nil
 }
 
-func writeNFOFile(path string, value jellyfinNFO) error {
+// encodeNFO 生成 NFO 的最终字节。抽出来是为了让「内容有没有变」可以先比较再落盘。
+func encodeNFO(value jellyfinNFO) ([]byte, error) {
 	var builder strings.Builder
 	builder.WriteString(xml.Header)
 	encoder := xml.NewEncoder(&builder)
 	encoder.Indent("", "  ")
 	if err := encoder.Encode(value); err != nil {
-		return fmt.Errorf("encode NFO: %w", err)
+		return nil, fmt.Errorf("encode NFO: %w", err)
 	}
 	if err := encoder.Close(); err != nil {
-		return fmt.Errorf("finish NFO: %w", err)
+		return nil, fmt.Errorf("finish NFO: %w", err)
 	}
-	return writeFileAtomically(path, strings.NewReader(builder.String()), 0o644)
+	return []byte(builder.String()), nil
+}
+
+func writeNFOFile(path string, value jellyfinNFO) error {
+	data, err := encodeNFO(value)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomically(path, bytes.NewReader(data), 0o644)
+}
+
+// writeNFOIfChanged 只在内容真的变化时才落盘，返回是否写了文件。
+//
+// 整理会反复处理同一个目录，旧实现无条件重写，导致已经刮削好的 NFO
+// 每次都被盖上当天的 mtime（Emby/Jellyfin 侧看起来像"刚刮削"）。
+// 这里做两级比较：先比字节（绝大多数情况直接命中），再按字段比内容——
+// 数据库里标签/演员没有稳定排序，只有顺序抖动时不应触发重写。
+func writeNFOIfChanged(path string, value jellyfinNFO) (bool, error) {
+	data, err := encodeNFO(value)
+	if err != nil {
+		return false, err
+	}
+	existing, readErr := os.ReadFile(path)
+	if readErr == nil {
+		if bytes.Equal(existing, data) {
+			return false, nil
+		}
+		var parsed jellyfinNFO
+		if xml.Unmarshal(existing, &parsed) == nil && nfoEquivalent(parsed, value) {
+			return false, nil
+		}
+	} else if !errors.Is(readErr, os.ErrNotExist) {
+		return false, fmt.Errorf("read existing NFO: %w", readErr)
+	}
+	if err := writeFileAtomically(path, bytes.NewReader(data), 0o644); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// nfoEquivalent 按字段比较两份 NFO，忽略体裁/标签/演员的排列顺序。
+func nfoEquivalent(left, right jellyfinNFO) bool {
+	if left.Generator != right.Generator ||
+		left.Title != right.Title ||
+		left.OriginalTitle != right.OriginalTitle ||
+		left.SortTitle != right.SortTitle ||
+		left.UniqueID != right.UniqueID ||
+		left.Premiered != right.Premiered ||
+		left.ReleaseDate != right.ReleaseDate ||
+		left.Year != right.Year ||
+		left.Runtime != right.Runtime ||
+		left.Tagline != right.Tagline ||
+		left.Outline != right.Outline ||
+		left.Mpaa != right.Mpaa ||
+		left.Studio != right.Studio ||
+		left.DateAdded != right.DateAdded ||
+		!equalUnorderedStrings(left.Genres, right.Genres) ||
+		!equalUnorderedStrings(left.Tags, right.Tags) ||
+		!equalUnorderedActors(left.Actors, right.Actors) {
+		return false
+	}
+	switch {
+	case left.Set == nil && right.Set == nil:
+		return true
+	case left.Set == nil || right.Set == nil:
+		return false
+	default:
+		return left.Set.Name == right.Set.Name
+	}
+}
+
+func equalUnorderedStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	leftCopy := append([]string(nil), left...)
+	rightCopy := append([]string(nil), right...)
+	sort.Strings(leftCopy)
+	sort.Strings(rightCopy)
+	for i := range leftCopy {
+		if leftCopy[i] != rightCopy[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func equalUnorderedActors(left, right []jellyfinActor) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	leftNames := make([]string, 0, len(left))
+	for _, actor := range left {
+		leftNames = append(leftNames, actor.Name)
+	}
+	rightNames := make([]string, 0, len(right))
+	for _, actor := range right {
+		rightNames = append(rightNames, actor.Name)
+	}
+	return equalUnorderedStrings(leftNames, rightNames)
+}
+
+// sidecarFileUpToDate 判断「由 source 原样复制出来的 target」是否已经是最新的：
+// 尺寸相同且 target 不比 source 旧。纯 stat 判定，不读文件内容。
+func sidecarFileUpToDate(sourcePath, targetPath string) bool {
+	source, err := os.Stat(sourcePath)
+	if err != nil || !source.Mode().IsRegular() || source.Size() == 0 {
+		return false
+	}
+	target, err := os.Stat(targetPath)
+	if err != nil || target.Size() != source.Size() {
+		return false
+	}
+	return !target.ModTime().Before(source.ModTime())
+}
+
+// posterUpToDate 报告现有海报是否已经是「当前封面 + 当前裁剪比例」的产物。
+//
+// 判定只看文件属性与图片头，不把像素解出来、更不重新编码：
+//   - 尺寸比对：封面被我方更新过、或裁剪比例改过，尺寸就不再匹配；
+//   - mtime 比对：封面被重新下载后，旧海报必须重裁。
+//
+// 因此每个条目的开销是 2 次 stat + 1 次图片头读取（几十字节），
+// 真正的解码/编码只在判定为过期之后才发生。
+func posterUpToDate(coverPath, posterPath string) bool {
+	coverInfo, err := os.Stat(coverPath)
+	if err != nil || !coverInfo.Mode().IsRegular() {
+		return false
+	}
+	posterInfo, err := os.Stat(posterPath)
+	if err != nil || posterInfo.Size() <= 0 {
+		return false
+	}
+	if posterInfo.ModTime().Before(coverInfo.ModTime()) {
+		return false
+	}
+	wantWidth, wantHeight, ok := expectedPosterDimensions(coverPath, posterCropFraction())
+	if !ok {
+		return false
+	}
+	gotWidth, gotHeight, ok := imageDimensions(posterPath)
+	if !ok {
+		return false
+	}
+	return wantWidth == gotWidth && wantHeight == gotHeight
+}
+
+// expectedPosterDimensions 预测写出的海报尺寸，判定规则与 writeCroppedPoster 保持一致。
+func expectedPosterDimensions(coverPath string, crop float64) (int, int, bool) {
+	file, err := os.Open(coverPath)
+	if err != nil {
+		return 0, 0, false
+	}
+	defer file.Close()
+	config, format, err := image.DecodeConfig(file)
+	if err != nil {
+		return 0, 0, false
+	}
+	width, height := config.Width, config.Height
+	if width <= 0 || height <= 0 {
+		return 0, 0, false
+	}
+	// 下面这些分支都会回退成"整图复制"，预期尺寸就是封面原尺寸。
+	if format != "jpeg" && format != "png" {
+		return width, height, true
+	}
+	if crop <= 0 {
+		return width, height, true
+	}
+	cut := int(math.Round(float64(width) * crop))
+	if cut <= 0 || cut >= width {
+		return width, height, true
+	}
+	return width - cut, height, true
+}
+
+func imageDimensions(path string) (int, int, bool) {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, 0, false
+	}
+	defer file.Close()
+	config, _, err := image.DecodeConfig(file)
+	if err != nil {
+		return 0, 0, false
+	}
+	if config.Width <= 0 || config.Height <= 0 {
+		return 0, 0, false
+	}
+	return config.Width, config.Height, true
 }
 
 func copyFileAtomically(source, target string) error {

@@ -46,12 +46,25 @@ func TestJavSidecarCompleteRequiresNFOAndPoster(t *testing.T) {
 		t.Fatal("video without NFO should be reported as incomplete")
 	}
 
-	// 第三方 NFO：依旧视为未整理，整理流程会保留它并只补封面。
+	// 第三方 NFO 只代表元数据到位；封面还缺，所以仍算未整理。
 	if err := os.WriteFile(filepath.Join(dir, "stars-182.nfo"), []byte("<movie><title>x</title></movie>"), 0o644); err != nil {
 		t.Fatalf("write foreign nfo: %v", err)
 	}
 	if javSidecarComplete(video, true) {
-		t.Fatal("foreign NFO should not count as JavBoss-processed")
+		t.Fatal("foreign NFO without a poster should still be incomplete")
+	}
+	// 第三方 NFO + 封面齐全：条目已就绪，不能再算 pending。
+	// 否则整目录的 pending 永远归不了零，自动整理会把整个目录反复重跑，
+	// 结果就是已经刮削好的 NFO/封面 mtime 被反复刷新。
+	foreignPoster := filepath.Join(dir, "stars-182-poster.jpg")
+	if err := os.WriteFile(foreignPoster, []byte("jpeg-bytes"), 0o644); err != nil {
+		t.Fatalf("write foreign poster: %v", err)
+	}
+	if !javSidecarComplete(video, true) {
+		t.Fatal("foreign NFO plus poster should count as processed")
+	}
+	if err := os.Remove(foreignPoster); err != nil {
+		t.Fatalf("remove foreign poster: %v", err)
 	}
 
 	// JavBoss 自己的 NFO，但封面还没下载好：仍算未整理。

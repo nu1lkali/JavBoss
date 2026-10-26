@@ -494,11 +494,13 @@ func (m *Manager) startAutoProcessJob(ctx context.Context, job *autoProcessJob) 
 	)
 }
 
-// countUnprocessedJavs 统计目录下“已关联 JAV、但 NFO 或封面还没写好”的视频数量。
+// countUnprocessedJavs 统计目录下“已关联 JAV、但 NFO 或封面还没就绪”的视频数量。
 //
 // 只有 NFO 和海报都落盘才算完成：writeJavSidecars 先写 NFO 再写封面，
 // 封面没下载好时只记 posterPending，因此单看 NFO 会把缺图条目误判成已完成。
 // 未启用封面下载（没有 CoverDir）时放弃海报判定，否则永远清不了队列。
+// 目录里凡是仍有条目 pending，自动整理就会把整个目录再跑一轮，
+// 所以这里的判定必须能收敛——判定过严会让整个目录被无限重写。
 func countUnprocessedJavs(ctx context.Context, directory models.Directory) (int, error) {
 	root := strings.TrimSpace(directory.Path)
 	if root == "" || !filepath.IsAbs(root) {
@@ -529,14 +531,22 @@ func countUnprocessedJavs(ctx context.Context, directory models.Directory) (int,
 // javSidecarImageExts 是海报可能落盘的扩展名，取决于刮削源给的封面格式。
 var javSidecarImageExts = []string{".jpg", ".jpeg", ".png", ".webp"}
 
-// javSidecarComplete 报告视频旁的 NFO 与海报是否都已由 JavBoss 写好。
+// javSidecarComplete 报告视频旁的 NFO 与海报是否都已就绪。
 //
-// NFO 判定沿用 canWriteJavBossNFO 的三种结果：文件不存在与第三方 NFO
-// 都算未完成——第三方 NFO 的条目仍需整理（保留它的 NFO，补写封面）。
+// NFO 的归属不再作为门槛：第三方刮削器写的 NFO 同样意味着「元数据已经到位」，
+// 整理流程会原样保留它、只补缺失的封面。早先把第三方 NFO 一律算作未完成，
+// 结果整目录的 pending 永远归不了零，自动整理每次扫描都会把整个目录重跑一遍
+// —— 表现就是已经刮削好的 NFO/封面 mtime 天天被刷新。
+//
+// 空 NFO 视为残缺（只是占位），仍交给整理流程补写。
+//
+// 注意：这里只管"文件在不在"，不比对裁剪参数。改了 JAVBOSS_POSTER_CROP_LEFT
+// 之后已就绪的目录不会自动重排，需要手动点一次「整理」；海报尺寸与当前裁剪比例
+// 不符时 posterUpToDate 会判定为过期并重裁，所以手动整理一次即可收敛。
 func javSidecarComplete(videoPath string, requirePoster bool) bool {
 	base := strings.TrimSuffix(videoPath, filepath.Ext(videoPath))
-	owned, err := canWriteJavBossNFO(base + ".nfo")
-	if err != nil || !owned {
+	info, err := os.Stat(base + ".nfo")
+	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
 		return false
 	}
 	if !requirePoster {
