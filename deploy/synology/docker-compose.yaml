@@ -2,7 +2,7 @@ name: javboss
 
 # JavBoss 群晖 NAS 专用编排文件。
 # 与根目录 compose.local.yaml 的区别：
-#   1. 使用固定数据卷（/volume1/docker/javboss/data），升级不丢库；
+#   1. 使用固定数据卷（/volume1/docker/javboss-data），升级不丢库；
 #   2. 用户与权限通过 PUID/PGID 注入，适配群晖的目录属主；
 #   3. 媒体目录路径在宿主机与容器内保持一致，STRM 里的本地路径可直接命中；
 #   4. 端口与路径全部来自同目录的 .env，脚本会自动生成。
@@ -55,7 +55,7 @@ services:
       JAVBOSS_AUTO_PROCESS_COVER_WAIT: "${JAVBOSS_AUTO_PROCESS_COVER_WAIT:-5m}"
     volumes:
       - type: bind
-        source: ${DATA_DIR:-/volume1/docker/javboss/data}
+        source: ${DATA_DIR:-/volume1/docker/javboss-data}
         target: /app/data
         bind:
           create_host_path: true

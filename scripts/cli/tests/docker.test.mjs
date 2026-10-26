@@ -133,6 +133,17 @@ test("explicit container user and group are passed to Compose", (t) => {
   assert.equal(result.calls.at(-1).gid, "2345");
 });
 
+// 数据目录默认名必须是 javboss-data（一眼可辨）；仅当仓库里还留着旧默认
+// docker-data 且新目录不存在时，才继续用旧目录，避免升级后换目录丢库。
+test("data directory defaults to javboss-data with legacy docker-data fallback", (t) => {
+  const legacy = path.join(root, "docker-data");
+  const preferred = path.join(root, "javboss-data");
+  const expected = fs.existsSync(legacy) && !fs.existsSync(preferred) ? legacy : preferred;
+  const result = invoke(t, ["docker", "start"], "", "5174", { JAVBOSS_DOCKER_DATA_DIR: "" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.calls.at(-1).dataDir, expected);
+});
+
 test("root and invalid container identities fail before building", (t) => {
   for (const env of [
     { JAVBOSS_DOCKER_UID: "0" }, { JAVBOSS_DOCKER_UID: "root" },

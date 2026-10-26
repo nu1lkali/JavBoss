@@ -17,7 +17,7 @@ services:
       JAVBOSS_PROXY_HOST_GATEWAY: "0"
     volumes:
       - type: bind
-        source: ${JAVBOSS_DOCKER_DATA_DIR:-./docker-data}
+        source: ${JAVBOSS_DOCKER_DATA_DIR:-./javboss-data}
         target: /app/data
         bind:
           create_host_path: false
