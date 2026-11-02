@@ -692,6 +692,16 @@ func updateConfig(c *gin.Context) {
 	}
 	applyRuntimeConfigFields(cfg, c.Request.RemoteAddr)
 	c.JSON(http.StatusOK, cfg)
+
+	// Emby 联动：本次保存涉及 Emby 配置且已经配置完整，立即在后台触发一次媒体库刷新，
+	// 让用户配完地址/密钥、打开开关就能立刻看到效果，不必等下一次 NFO 变动。
+	// 刷新走网络、可能较久，且只在真正配置完整时才发；用独立 context，避免请求结束
+	// 把后台刷新一起取消。未配置完整（比如只开了开关但还没填地址/密钥）则静默跳过。
+	if entries[emby.EnabledKey] != "" || entries[emby.URLKey] != "" || entries[emby.APIKeyKey] != "" {
+		if emby.FromConfig(cfg).Configured() {
+			go emby.NotifyRefresh(context.Background(), cfg, true)
+		}
+	}
 }
 
 // testEmbyConnection 用刚填写的地址和密钥试连 Emby。
