@@ -161,6 +161,13 @@ func RefreshLibraries(ctx context.Context, s Settings) (int, error) {
 		return 0, err
 	}
 	targets := selectFolders(folders.Items)
+	if len(targets) == 0 {
+		// 静默 no-op 是之前"整理完也不刷"的元凶之一：/Library/MediaFolders 没返回库，
+		// 或返回的全是未归类的库，selectFolders 退化为全量却仍为空（极少见）。
+		// 打出来，用户才能从日志判断是"没触发"还是"触发了但没命中库"。
+		logging.Error("emby refresh: /Library/MediaFolders 返回 %d 个库，筛选后 0 个可刷新 url=%s（库是否都归类过？）", len(folders.Items), s.BaseURL)
+		return 0, nil
+	}
 	refreshed := 0
 	var firstErr error
 	for _, folder := range targets {
@@ -171,6 +178,10 @@ func RefreshLibraries(ctx context.Context, s Settings) (int, error) {
 			continue
 		}
 		refreshed++
+	}
+	if refreshed == 0 && firstErr == nil {
+		// 理论上走不到（targets 非空时至少会尝试一个），但留个兜底日志。
+		logging.Error("emby refresh: 命中 %d 个库但 0 个刷新成功 url=%s", len(targets), s.BaseURL)
 	}
 	return refreshed, firstErr
 }
@@ -225,6 +236,9 @@ func NotifyRefresh(ctx context.Context, cfg map[string]string, force bool) {
 	}
 	s := FromConfig(cfg)
 	if !s.Configured() {
+		// 之前"整理完也不刷"的另一类静默失败：触发点其实走到了，但此刻配置没被当成
+		// 完整（开关没开 / 地址为空 / 密钥为空）。打出来，排查才有方向。
+		logging.Info("emby refresh skipped: not configured (enabled=%t url=%q has_key=%t)", s.Enabled, s.BaseURL, s.APIKey != "")
 		return
 	}
 	notifyMu.Lock()
@@ -327,6 +341,7 @@ func postNoContent(ctx context.Context, url, apiKey string) error {
 	if err != nil {
 		return fmt.Errorf("请求地址无效：%v", err)
 	}
+	req.Header.Set("Content-Type", "application/json")
 	if apiKey != "" {
 		req.Header.Set("X-Emby-Token", apiKey)
 	}
