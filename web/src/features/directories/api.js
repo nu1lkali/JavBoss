@@ -115,3 +115,14 @@ export async function testEmbyConnection({ url, apiKey }) {
   }
   return res.json()
 }
+
+// 列出 Emby 的媒体库，供设置页勾选"只刷新这些库"。
+// 返回 { libraries: [{ id, name, collection_type }], selected: [id, ...] }。
+// 用已保存的地址和密钥（不要求联动开关已打开）。
+export async function fetchEmbyLibraries() {
+  const res = await apiFetch('/emby/libraries')
+  if (!res.ok) {
+    throw await apiError(res)
+  }
+  return res.json()
+}

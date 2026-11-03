@@ -78,6 +78,7 @@ func isAPIPath(path string) bool {
 		"/directories",
 		"/downloader",
 		"/downloads",
+		"/emby",
 		"/extension",
 		"/healthz",
 		"/jav",

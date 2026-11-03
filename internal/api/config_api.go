@@ -150,6 +150,8 @@ func updateConfig(c *gin.Context) {
 		JavEmbyEnabled            *bool                      `json:"jav_emby_enabled"`
 		JavEmbyURL                *string                    `json:"jav_emby_url"`
 		JavEmbyAPIKey             *string                    `json:"jav_emby_api_key"`
+		// JavEmbyLibraryIDs 为 nil 表示"不修改"；空数组表示清空（回到默认策略）。
+		JavEmbyLibraryIDs *[]string `json:"jav_emby_library_ids"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		respondLocalizedError(c, http.StatusBadRequest, "配置请求无效", "Invalid configuration request")
@@ -516,6 +518,31 @@ func updateConfig(c *gin.Context) {
 	if req.JavEmbyAPIKey != nil {
 		entries[emby.APIKeyKey] = strings.TrimSpace(*req.JavEmbyAPIKey)
 	}
+	if req.JavEmbyLibraryIDs != nil {
+		// 统一存成 JSON 数组字符串；去空白、去重后为空数组时写 "[]"，
+		// 表示"清空选择"，刷新时回到默认策略（优先电影库）。
+		ids := make([]string, 0, len(*req.JavEmbyLibraryIDs))
+		seen := make(map[string]struct{}, len(*req.JavEmbyLibraryIDs))
+		for _, id := range *req.JavEmbyLibraryIDs {
+			v := strings.TrimSpace(id)
+			if v == "" {
+				continue
+			}
+			if _, ok := seen[v]; ok {
+				continue
+			}
+			seen[v] = struct{}{}
+			ids = append(ids, v)
+		}
+		raw, err := json.Marshal(ids)
+		if err != nil {
+			respondLocalizedError(c, http.StatusBadRequest, "Emby 媒体库选择无效", "Invalid Emby library selection")
+			return
+		}
+		entries[emby.LibraryIDsKey] = string(raw)
+		// 勾选没生效时，先看这条：0 表示前端没把选择带上来，非 0 而界面仍空白则是展示问题。
+		logging.Info("emby refresh scope saved libraries=%d ids=%v", len(ids), ids)
+	}
 	if req.PlayerHotkeys != nil {
 		clean := make([]playerHotkeyPayload, 0, len(req.PlayerHotkeys))
 		seen := make(map[string]struct{}, len(req.PlayerHotkeys))
@@ -686,6 +713,10 @@ func updateConfig(c *gin.Context) {
 		respondLocalizedError(c, http.StatusInternalServerError, "读取已保存的配置失败", "Failed to load the saved configuration")
 		return
 	}
+	// 必须在 applyRuntimeConfigFields 之前取 Emby 设置：它内部会调用
+	// emby.PublicConfig 把密钥明文从 map 里删掉，之后再 FromConfig 就只能读到空串，
+	// Configured() 恒为 false —— 那正是"配好密钥保存后却不刷新"的原因。
+	embySettings := emby.FromConfig(cfg)
 	util.SetProxySettings(cfg["proxy_mode"], cfg["proxy_host"], cfg["proxy_port"])
 	if req.ProxyMode != nil || req.ProxyHost != nil || req.ProxyPort != nil {
 		scrape.InvalidateAvailabilityCache()
@@ -695,11 +726,19 @@ func updateConfig(c *gin.Context) {
 
 	// Emby 联动：本次保存涉及 Emby 配置且已经配置完整，立即在后台触发一次媒体库刷新，
 	// 让用户配完地址/密钥、打开开关就能立刻看到效果，不必等下一次 NFO 变动。
-	// 刷新走网络、可能较久，且只在真正配置完整时才发；用独立 context，避免请求结束
-	// 把后台刷新一起取消。未配置完整（比如只开了开关但还没填地址/密钥）则静默跳过。
+	// 刷新走网络、可能较久，用独立 context，避免请求结束把后台刷新一起取消。
+	// 注意用的是上面提前捕获的 embySettings：此时 cfg 已被脱敏，密钥不在里面了。
+	// 注意：只改"刷新范围"不触发刷新。前端改成勾选即保存，若这里把 LibraryIDsKey
+	// 也算作触发条件，用户连点几个复选框就会对同一个库发起多次全量元数据刷新。
 	if entries[emby.EnabledKey] != "" || entries[emby.URLKey] != "" || entries[emby.APIKeyKey] != "" {
-		if emby.FromConfig(cfg).Configured() {
-			go emby.NotifyRefresh(context.Background(), cfg, true)
+		if embySettings.Configured() {
+			go emby.Notify(context.Background(), embySettings, true)
+		} else {
+			// 不再静默：配置不完整时也留一条，避免"点了保存却毫无反应"无从排查。
+			logging.Info(
+				"emby refresh skipped: config incomplete (enabled=%t url=%q has_key=%t)",
+				embySettings.Enabled, embySettings.BaseURL, embySettings.APIKey != "",
+			)
 		}
 	}
 }
@@ -726,6 +765,38 @@ func testEmbyConnection(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"server_name": info.ServerName,
 		"version":     info.Version,
+	})
+}
+
+// listEmbyLibraries 返回 Emby 的媒体库列表，供设置页勾选"只刷新这些库"。
+// 地址和密钥取自已保存的配置（不要求联动开关已经打开）。
+func listEmbyLibraries(c *gin.Context) {
+	cfg, err := dbpkg.Default().ListConfig(c.Request.Context())
+	if err != nil {
+		logging.Error("list config for emby libraries error: %v", err)
+		respondLocalizedError(c, http.StatusInternalServerError, "读取配置失败", "Failed to load configuration")
+		return
+	}
+	s := emby.FromConfig(cfg)
+	if strings.TrimSpace(s.BaseURL) == "" || s.APIKey == "" {
+		respondLocalizedError(c, http.StatusBadRequest, "请先填写 Emby 地址和 API 密钥", "Emby URL and API key are required")
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
+	defer cancel()
+	libs, err := emby.ListLibraries(ctx, s)
+	if err != nil {
+		logging.Info("list emby libraries failed err=%v", err)
+		respondLocalizedError(c, http.StatusBadGateway, "读取 Emby 媒体库失败："+err.Error(), "Failed to list Emby libraries")
+		return
+	}
+	selected := s.LibraryIDs
+	if selected == nil {
+		selected = []string{}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"libraries": libs,
+		"selected":  selected,
 	})
 }
 

@@ -12,6 +12,7 @@ import {
   rebuildNFO,
   fetchNFORebuildStatus,
   testEmbyConnection,
+  fetchEmbyLibraries,
 } from '@/features/directories/api'
 import { updateConfig } from '@/features/settings/api'
 import { normalizeDefaultPlayer } from '@/features/playback/model'
@@ -140,6 +141,8 @@ export default function GlobalSettings({ onToast, open, onClose }) {
       embyEnabled={configFlag(config?.jav_emby_enabled)}
       embyURL={config?.jav_emby_url || ''}
       embyAPIKeySet={configFlag(config?.jav_emby_api_key_set)}
+      embyLibraryIDs={config?.jav_emby_library_ids || ''}
+      onFetchEmbyLibraries={fetchEmbyLibraries}
       onSaveEmbySettings={async (payload) => {
         const cfg = await updateConfig(payload)
         useStore.setState({ config: cfg })

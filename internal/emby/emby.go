@@ -30,6 +30,9 @@ const (
 	URLKey       = "jav_emby_url"
 	APIKeyKey    = "jav_emby_api_key"
 	APIKeySetKey = "jav_emby_api_key_set"
+	// LibraryIDsKey 保存用户勾选的媒体库 ID（JSON 数组字符串）。
+	// 为空表示沿用默认策略：优先电影库，一个都没有时退化为全部库。
+	LibraryIDsKey = "jav_emby_library_ids"
 )
 
 // requestTimeout 单次 Emby 请求的超时。刷新整库可能较久，但每个库一个请求，
@@ -55,6 +58,8 @@ type Settings struct {
 	Enabled bool
 	BaseURL string
 	APIKey  string
+	// LibraryIDs 限定只刷新这些库（为空则按默认策略挑选）。
+	LibraryIDs []string
 }
 
 // Configured 判断配置是否完整到可以发起请求。
@@ -72,7 +77,35 @@ func FromConfig(cfg map[string]string) Settings {
 		return s
 	}
 	s.Enabled = parseBool(cfg[EnabledKey])
+	s.LibraryIDs = ParseLibraryIDs(cfg[LibraryIDsKey])
 	return s
+}
+
+// ParseLibraryIDs 解析库 ID 列表：正常是 JSON 数组字符串，同时兼容逗号分隔的写法，
+// 顺便去空白、去重，避免前端手写配置时留下脏值。
+func ParseLibraryIDs(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var ids []string
+	if err := json.Unmarshal([]byte(raw), &ids); err != nil {
+		ids = strings.Split(raw, ",")
+	}
+	out := make([]string, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		v := strings.TrimSpace(id)
+		if v == "" {
+			continue
+		}
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
 }
 
 // PublicConfig 在配置对外返回前调用：删除密钥明文，只保留"是否已配置"的布尔值。
@@ -147,8 +180,42 @@ func TestConnection(ctx context.Context, baseURL, apiKey string) (ServerInfo, er
 	return result, nil
 }
 
-// RefreshLibraries 让 Emby 重新扫描所有（电影类）媒体库的元数据。
-// 返回实际刷新的库数量。
+// Library 是 Emby 里的一个媒体库，供设置页勾选刷新范围。
+type Library struct {
+	ID             string `json:"id"`
+	Name           string `json:"name"`
+	CollectionType string `json:"collection_type"`
+}
+
+// ListLibraries 读取 Emby 的媒体库列表。
+// 只要求地址和密钥，不要求联动开关已打开——方便用户"先选库、再开开关"。
+func ListLibraries(ctx context.Context, s Settings) ([]Library, error) {
+	if s.BaseURL == "" || s.APIKey == "" {
+		return nil, errors.New("Emby 地址或 API 密钥未配置")
+	}
+	if err := ValidateBaseURL(s.BaseURL); err != nil {
+		return nil, err
+	}
+	var folders mediaFoldersResponse
+	if err := getJSON(ctx, s.BaseURL+"/Library/MediaFolders", s.APIKey, &folders); err != nil {
+		return nil, err
+	}
+	out := make([]Library, 0, len(folders.Items))
+	for _, item := range folders.Items {
+		if item.ID == "" {
+			continue
+		}
+		out = append(out, Library{
+			ID:             item.ID,
+			Name:           item.Name,
+			CollectionType: item.CollectionType,
+		})
+	}
+	return out, nil
+}
+
+// RefreshLibraries 让 Emby 重新扫描媒体库的元数据。
+// 刷哪些库由 Settings.LibraryIDs 决定（为空则按默认策略）。返回实际刷新的库数量。
 func RefreshLibraries(ctx context.Context, s Settings) (int, error) {
 	if !s.Configured() {
 		return 0, nil
@@ -160,16 +227,20 @@ func RefreshLibraries(ctx context.Context, s Settings) (int, error) {
 	if err := getJSON(ctx, s.BaseURL+"/Library/MediaFolders", s.APIKey, &folders); err != nil {
 		return 0, err
 	}
-	targets := selectFolders(folders.Items)
+	targets := selectFolders(folders.Items, s.LibraryIDs)
 	if len(targets) == 0 {
 		// 静默 no-op 是之前"整理完也不刷"的元凶之一：/Library/MediaFolders 没返回库，
 		// 或返回的全是未归类的库，selectFolders 退化为全量却仍为空（极少见）。
 		// 打出来，用户才能从日志判断是"没触发"还是"触发了但没命中库"。
-		logging.Error("emby refresh: /Library/MediaFolders 返回 %d 个库，筛选后 0 个可刷新 url=%s（库是否都归类过？）", len(folders.Items), s.BaseURL)
+		logging.Error(
+			"emby refresh: /Library/MediaFolders 返回 %d 个库，筛选后 0 个可刷新 url=%s selected=%d（勾选的库是否已被删除？）",
+			len(folders.Items), s.BaseURL, len(s.LibraryIDs),
+		)
 		return 0, nil
 	}
 	refreshed := 0
 	var firstErr error
+	names := make([]string, 0, len(targets))
 	for _, folder := range targets {
 		if err := refreshFolder(ctx, s, folder.ID); err != nil {
 			if firstErr == nil {
@@ -178,17 +249,43 @@ func RefreshLibraries(ctx context.Context, s Settings) (int, error) {
 			continue
 		}
 		refreshed++
+		names = append(names, folder.Name)
 	}
 	if refreshed == 0 && firstErr == nil {
 		// 理论上走不到（targets 非空时至少会尝试一个），但留个兜底日志。
 		logging.Error("emby refresh: 命中 %d 个库但 0 个刷新成功 url=%s", len(targets), s.BaseURL)
 	}
+	if refreshed > 0 {
+		// 带上库名，方便一眼确认"到底刷了哪几个"，不必再猜是不是刷多了。
+		logging.Info("emby refresh triggered url=%s libraries=%d folders=%s", s.BaseURL, refreshed, strings.Join(names, ","))
+	}
 	return refreshed, firstErr
 }
 
-// selectFolders 优先刷新电影库；一个电影库都没有时退回刷新全部库，
-// 避免用户的库类型设置不同就完全刷不到。
-func selectFolders(items []mediaFolder) []mediaFolder {
+// selectFolders 决定刷新哪些库。
+//
+// 用户显式勾选了库（selected 非空）时只刷这些，其它一概不碰——多库用户
+// （比如同时有 9 个电影库）不会因为改一条 NFO 就把所有库全量重读一遍。
+// 没勾选时退回默认策略：优先电影库；一个都没有时刷全部。
+func selectFolders(items []mediaFolder, selected []string) []mediaFolder {
+	if len(selected) > 0 {
+		wanted := make(map[string]struct{}, len(selected))
+		for _, id := range selected {
+			if v := strings.TrimSpace(id); v != "" {
+				wanted[v] = struct{}{}
+			}
+		}
+		picked := make([]mediaFolder, 0, len(wanted))
+		for _, item := range items {
+			if item.ID == "" {
+				continue
+			}
+			if _, ok := wanted[item.ID]; ok {
+				picked = append(picked, item)
+			}
+		}
+		return picked
+	}
 	movies := make([]mediaFolder, 0, len(items))
 	for _, item := range items {
 		if item.ID == "" {
@@ -210,11 +307,20 @@ func selectFolders(items []mediaFolder) []mediaFolder {
 	return all
 }
 
-// refreshFolder 对单个媒体库发起刷新。ReplaceAllMetadata/ReplaceAllImages
-// 必须带上，否则 Emby 默认保留条目上已有的元数据，NFO 改了也不会生效。
+// refreshFolder 对单个媒体库发起刷新。
+//
+// 只刷新元数据，绝对不要带 ImageRefreshMode=FullRefresh / ReplaceAllImages=true：
+// 那组参数的语义是"把条目上的图片全部替换成重新抓取的图片"，而 JAV 条目在 Emby
+// 的元数据源里基本抓不到任何图片，净效果就是原有封面被清空。
+// （2026-11-02 实测事故：勾选的库里封面全部丢失。）
+// 封面由 JavBoss 写在视频旁的 -poster.jpg / -fanart.jpg 提供，Emby 只需按本地
+// 图片扫描即可，不需要"替换"。
+//
+// ReplaceAllMetadata=true 必须保留：没有它 Emby 会沿用条目上已有的元数据，
+// NFO 改了也不生效 —— 这才是刷新元数据要的效果。
 func refreshFolder(ctx context.Context, s Settings, folderID string) error {
 	url := fmt.Sprintf(
-		"%s/Items/%s/Refresh?Recursive=true&MetadataRefreshMode=FullRefresh&ImageRefreshMode=FullRefresh&ReplaceAllMetadata=true&ReplaceAllImages=true",
+		"%s/Items/%s/Refresh?Recursive=true&MetadataRefreshMode=FullRefresh&ReplaceAllMetadata=true",
 		s.BaseURL, folderID,
 	)
 	return postNoContent(ctx, url, s.APIKey)
@@ -234,7 +340,16 @@ func NotifyRefresh(ctx context.Context, cfg map[string]string, force bool) {
 	if cfg == nil {
 		return
 	}
-	s := FromConfig(cfg)
+	Notify(ctx, FromConfig(cfg), force)
+}
+
+// Notify 用已经解析好的设置触发刷新。
+//
+// 单独提供一个接收 Settings 的入口，是因为调用方手里不一定还有原始配置 map：
+// api 层在把配置返回给前端之前会调用 PublicConfig 删掉密钥明文，之后再
+// FromConfig 读到的 APIKey 就是空串，Configured() 恒为 false。
+// 「保存配置后不刷新」的根因正是这里——不要再把脱敏后的 map 喂给 FromConfig。
+func Notify(ctx context.Context, s Settings, force bool) {
 	if !s.Configured() {
 		// 之前"整理完也不刷"的另一类静默失败：触发点其实走到了，但此刻配置没被当成
 		// 完整（开关没开 / 地址为空 / 密钥为空）。打出来，排查才有方向。
@@ -262,9 +377,8 @@ func NotifyRefresh(ctx context.Context, cfg map[string]string, force bool) {
 		logging.Error("emby refresh failed url=%s libraries=%d err=%v", s.BaseURL, refreshed, err)
 		return
 	}
-	if refreshed > 0 {
-		logging.Info("emby refresh triggered url=%s libraries=%d", s.BaseURL, refreshed)
-	}
+	// 成功时的 "emby refresh triggered ... folders=..." 由 RefreshLibraries 打印，
+	// 那里才有库名，不必在这里再打一条重复的。
 }
 
 func getJSON(ctx context.Context, url, apiKey string, out any) error {

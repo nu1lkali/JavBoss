@@ -311,6 +311,72 @@ func TestTestConnectionRejectsUnreachableAndInvalidURL(t *testing.T) {
 	}
 }
 
+// 显式勾选了库时，只刷这些，哪怕它们不是 movies 类型；其它库一概不碰。
+func TestRefreshLibrariesHonorsExplicitSelection(t *testing.T) {
+	fake := newFakeEmby(t, []mediaFolder{
+		{ID: "1", Name: "电影A", CollectionType: "movies"},
+		{ID: "2", Name: "电影B", CollectionType: "movies"},
+		{ID: "3", Name: "剧集", CollectionType: "tvshows"},
+	}, "key")
+	refreshed, err := RefreshLibraries(context.Background(), Settings{
+		Enabled: true, BaseURL: fake.server.URL, APIKey: "key",
+		LibraryIDs: []string{"3"},
+	})
+	if err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if refreshed != 1 {
+		t.Fatalf("refreshed = %d, want 1 (only the explicitly selected library)", refreshed)
+	}
+	if got := fake.refreshCalls.Load(); got != 1 {
+		t.Fatalf("refresh calls = %d, want 1", got)
+	}
+}
+
+// 勾选的库在 Emby 里已经不存在时不能误刷其它库，应当 0 个也不刷。
+func TestRefreshLibrariesUnknownSelectionRefreshesNothing(t *testing.T) {
+	fake := newFakeEmby(t, []mediaFolder{
+		{ID: "1", Name: "电影", CollectionType: "movies"},
+	}, "key")
+	refreshed, err := RefreshLibraries(context.Background(), Settings{
+		Enabled: true, BaseURL: fake.server.URL, APIKey: "key",
+		LibraryIDs: []string{"gone"},
+	})
+	if err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if refreshed != 0 {
+		t.Fatalf("refreshed = %d, want 0 when the selected library is gone", refreshed)
+	}
+	if got := fake.refreshCalls.Load(); got != 0 {
+		t.Fatalf("refresh calls = %d, want 0", got)
+	}
+}
+
+func TestParseLibraryIDs(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want []string
+	}{
+		{"", nil},
+		{`["1","2"]`, []string{"1", "2"}},
+		{"1, 2 ,2,", []string{"1", "2"}},
+		{`["1"," 1 ","","2"]`, []string{"1", "2"}},
+		{"[]", []string{}},
+	}
+	for _, tc := range cases {
+		got := ParseLibraryIDs(tc.raw)
+		if len(got) != len(tc.want) {
+			t.Fatalf("ParseLibraryIDs(%q) = %v, want %v", tc.raw, got, tc.want)
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Fatalf("ParseLibraryIDs(%q) = %v, want %v", tc.raw, got, tc.want)
+			}
+		}
+	}
+}
+
 func TestRefreshLibrariesPrefersMovieLibraries(t *testing.T) {
 	fake := newFakeEmby(t, []mediaFolder{
 		{ID: "1", Name: "电影", CollectionType: "movies"},

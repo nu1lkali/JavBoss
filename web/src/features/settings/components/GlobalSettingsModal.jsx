@@ -147,6 +147,24 @@ function formatNFORebuildProgress(summary, dryRun) {
   return head + tail
 }
 
+// 解析"只刷新这些库"的已保存值：正常是 JSON 数组，兼容早期的逗号分隔写法。
+function parseEmbyLibraryIDs(raw) {
+  const text = String(raw ?? '').trim()
+  if (!text) return []
+  try {
+    const parsed = JSON.parse(text)
+    if (Array.isArray(parsed)) {
+      return parsed.map((item) => String(item)).filter(Boolean)
+    }
+  } catch {
+    // 不是 JSON 就走下面的逗号分隔兜底
+  }
+  return text
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean)
+}
+
 export default function GlobalSettingsModal({
   open,
   onClose,
@@ -180,8 +198,11 @@ export default function GlobalSettingsModal({
   embyEnabled = false,
   embyURL = '',
   embyAPIKeySet = false,
+  // 已保存的"只刷新这些库"选择（JSON 数组字符串或逗号分隔）。
+  embyLibraryIDs = '',
   onSaveEmbySettings,
   onTestEmbyConnection,
+  onFetchEmbyLibraries,
   defaultPlayer,
   onSaveDefaultPlayer,
   initialViewMode,
@@ -234,6 +255,10 @@ export default function GlobalSettingsModal({
   const [embyNotice, setEmbyNotice] = useState('')
   const [savingEmby, setSavingEmby] = useState(false)
   const [testingEmby, setTestingEmby] = useState(false)
+  // 刷新范围：Emby 媒体库清单 + 当前勾选的库 ID。
+  const [embyLibraries, setEmbyLibraries] = useState([])
+  const [embyLibraryIDsInput, setEmbyLibraryIDsInput] = useState([])
+  const [loadingEmbyLibraries, setLoadingEmbyLibraries] = useState(false)
   const [activeSection, setActiveSection] = useState('directories')
   const [defaultPlayerInput, setDefaultPlayerInput] = useState('mpv')
   const [defaultPlayerError, setDefaultPlayerError] = useState('')
@@ -320,6 +345,7 @@ export default function GlobalSettingsModal({
       setEmbyAPIKeyInput('')
       setEmbyError('')
       setEmbyNotice('')
+      setEmbyLibraryIDsInput(parseEmbyLibraryIDs(embyLibraryIDs))
       setDefaultPlayerInput(
         defaultPlayer === 'browser' || (defaultPlayer === 'system' && desktopIntegrationEnabled)
           ? defaultPlayer
@@ -370,6 +396,35 @@ export default function GlobalSettingsModal({
     browserPlaybackOnly,
     desktopIntegrationEnabled,
   ])
+
+  // 打开设置且 Emby 已配好时，自动拉一次媒体库列表。
+  // 否则用户下次打开只看到"点击读取媒体库"，误以为上次的勾选丢了。
+  useEffect(() => {
+    if (!open || !onFetchEmbyLibraries) return undefined
+    if (!embyEnabled || !embyURL || !embyAPIKeySet) return undefined
+    let cancelled = false
+    setLoadingEmbyLibraries(true)
+    onFetchEmbyLibraries()
+      .then((data) => {
+        if (cancelled) return
+        const list = Array.isArray(data?.libraries) ? data.libraries : []
+        setEmbyLibraries(list)
+        const saved = Array.isArray(data?.selected) ? data.selected.map(String) : []
+        // 以服务端已保存的选择为准（本地此时还没被编辑过）。
+        if (saved.length > 0) {
+          setEmbyLibraryIDsInput(saved)
+        }
+      })
+      .catch(() => {
+        // 自动加载失败不打扰用户：按钮仍可手动重试。
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingEmbyLibraries(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [open, embyEnabled, embyURL, embyAPIKeySet, onFetchEmbyLibraries])
 
   useEffect(() => {
     if (!open || activeSection !== 'tools') return undefined
@@ -1270,6 +1325,49 @@ export default function GlobalSettingsModal({
       }
     }
 
+    // 勾选/取消即时保存：保存按钮在列表上方，用户很容易漏点。
+    // 只写库选择，不带 enabled/url，所以不会每次都触发 Emby 刷新。
+    const applyLibrarySelection = async (nextIDs) => {
+      const previous = embyLibraryIDsInput
+      setEmbyLibraryIDsInput(nextIDs)
+      setEmbyError('')
+      setEmbyNotice('')
+      if (!onSaveEmbySettings) return
+      setSavingEmby(true)
+      try {
+        await onSaveEmbySettings({ jav_emby_library_ids: nextIDs })
+      } catch (err) {
+        // 保存失败就回滚勾选，避免界面显示的和库里存的不一致。
+        setEmbyLibraryIDsInput(previous)
+        setEmbyError(getErrorMessage(err))
+      } finally {
+        setSavingEmby(false)
+      }
+    }
+
+    // 读取 Emby 媒体库清单，供用户勾选"只刷新这些库"。
+    const handleLoadEmbyLibraries = async () => {
+      if (loadingEmbyLibraries || !onFetchEmbyLibraries) return
+      setEmbyError('')
+      setEmbyNotice('')
+      setLoadingEmbyLibraries(true)
+      try {
+        const data = await onFetchEmbyLibraries()
+        const list = Array.isArray(data?.libraries) ? data.libraries : []
+        setEmbyLibraries(list)
+        // 本地已有勾选（用户先改过）就不覆盖，否则用服务端已保存的选择。
+        const saved = Array.isArray(data?.selected) ? data.selected.map(String) : []
+        setEmbyLibraryIDsInput((prev) => (prev.length > 0 ? prev : saved))
+        if (list.length === 0) {
+          setEmbyNotice(zh('这个 Emby 里没有可用的媒体库', 'No libraries found on the Emby server'))
+        }
+      } catch (err) {
+        setEmbyError(getErrorMessage(err))
+      } finally {
+        setLoadingEmbyLibraries(false)
+      }
+    }
+
     const handleSaveEmby = async () => {
       if (savingEmby || !onSaveEmbySettings) return
       setEmbyError('')
@@ -1288,6 +1386,11 @@ export default function GlobalSettingsModal({
         }
         if (embyAPIKeyInput.trim() !== '') {
           payload.jav_emby_api_key = embyAPIKeyInput.trim()
+        }
+        // 只有把库清单真正读出来了，勾选状态才可信；否则不提交，
+        // 避免在没加载列表的情况下把已保存的选择误清空。
+        if (embyLibraries.length > 0) {
+          payload.jav_emby_library_ids = embyLibraryIDsInput
         }
         await onSaveEmbySettings(payload)
         setEmbyAPIKeyInput('')
@@ -1527,6 +1630,71 @@ export default function GlobalSettingsModal({
                 >
                   {testingEmby ? zh('正在连接…', 'Connecting…') : zh('测试连接', 'Test connection')}
                 </button>
+              </div>
+              <div className="rounded-xl border border-zinc-200 bg-zinc-50/60 p-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium text-zinc-700">{zh('刷新范围', 'Refresh scope')}</p>
+                    <p className="mt-0.5 text-xs text-zinc-500">
+                      {zh(
+                        '勾选即保存（不会触发刷新）。只刷新勾选的库；一个都不勾时默认刷新所有电影库。点上方「保存」才会立即刷新一次。',
+                        'Checking a library saves immediately (no refresh). Only checked libraries are refreshed; nothing checked means all movie libraries. Click Save above to refresh now.'
+                      )}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleLoadEmbyLibraries}
+                    disabled={loadingEmbyLibraries || !onFetchEmbyLibraries}
+                    className="shrink-0 rounded-xl border border-zinc-200 bg-white px-3 py-1.5 text-sm text-zinc-700 hover:bg-zinc-50 disabled:opacity-50"
+                  >
+                    {loadingEmbyLibraries ? zh('读取中…', 'Loading…') : zh('读取媒体库', 'Load libraries')}
+                  </button>
+                </div>
+                {embyLibraries.length > 0 ? (
+                  <div className="mt-2 max-h-40 space-y-0.5 overflow-y-auto">
+                    {embyLibraries.map((lib) => {
+                      const id = String(lib.id)
+                      const checked = embyLibraryIDsInput.includes(id)
+                      return (
+                        <label
+                          key={id}
+                          className="flex cursor-pointer items-center gap-2 rounded-lg px-1 py-1 text-sm text-zinc-700 hover:bg-white"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={(event) => {
+                              // 先取出 checked：这里的 nextIDs 要立刻用于保存，
+                              // 不能在函数式更新里延迟读取事件对象。
+                              const nextChecked = event.target.checked
+                              const nextIDs = nextChecked
+                                ? (embyLibraryIDsInput.includes(id)
+                                  ? embyLibraryIDsInput
+                                  : [...embyLibraryIDsInput, id])
+                                : embyLibraryIDsInput.filter((item) => item !== id)
+                              applyLibrarySelection(nextIDs)
+                            }}
+                            className="h-4 w-4 shrink-0 rounded border-zinc-300"
+                          />
+                          <span className="truncate">{lib.name || id}</span>
+                          {lib.collection_type ? (
+                            <span className="shrink-0 rounded bg-zinc-200/70 px-1.5 py-0.5 text-[11px] text-zinc-600">
+                              {lib.collection_type}
+                            </span>
+                          ) : null}
+                        </label>
+                      )
+                    })}
+                  </div>
+                ) : (
+                  <p className="mt-2 text-xs text-zinc-400">
+                    {zh(
+                      '点击「读取媒体库」加载列表（需先保存地址和密钥）',
+                      'Click "Load libraries" to fetch the list (save the URL and API key first)'
+                    )}
+                  </p>
+                )}
               </div>
               {embyNotice ? <p className="text-xs text-green-700">{embyNotice}</p> : null}
               {embyError ? (

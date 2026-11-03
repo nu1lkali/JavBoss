@@ -14,6 +14,8 @@ func RegisterRoutes(router gin.IRoutes) {
 	router.DELETE("/auth/extension-tokens/:id", deleteExtensionToken)
 	router.GET("/config", getConfig)
 	router.PATCH("/config", updateConfig)
+	// Emby 联动：列出可勾选的媒体库（刷新范围）。
+	router.GET("/emby/libraries", listEmbyLibraries)
 	router.GET("/system/resources", getResources)
 	router.GET("/tools", getTools)
 	router.POST("/tools/ffmpeg/download", downloadFFmpeg)
