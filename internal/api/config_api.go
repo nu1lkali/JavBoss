@@ -91,11 +91,15 @@ func updateConfig(c *gin.Context) {
 	}
 
 	var req struct {
+		SubtitleAutoDownload      *bool                      `json:"subtitle_auto_download"`
+		SubtitleLanguage          *string                    `json:"subtitle_language"`
 		VideoPageSize             *int                       `json:"video_page_size"`
 		VideoWaterfallDefault     *bool                      `json:"video_waterfall_default"`
+		VideoShowDirectoryBar     *bool                      `json:"video_show_directory_bar"`
 		JavPageSize               *int                       `json:"jav_page_size"`
 		JavGridColumns            *int                       `json:"jav_grid_columns"`
 		JavCardPortrait           *bool                      `json:"jav_card_portrait"`
+		JavHighSaturationTags     *bool                      `json:"jav_high_saturation_tags"`
 		JavTitleMaxRows           *int                       `json:"jav_title_max_rows"`
 		TitleTranslateProvider    *string                    `json:"jav_title_translation_provider"`
 		TitleTranslateProfiles    map[string]json.RawMessage `json:"jav_title_translation_profiles"`
@@ -159,6 +163,16 @@ func updateConfig(c *gin.Context) {
 	}
 
 	entries := make(map[string]string)
+	if req.SubtitleAutoDownload != nil {
+		entries["subtitle_auto_download"] = strconv.FormatBool(*req.SubtitleAutoDownload)
+	}
+	if req.SubtitleLanguage != nil {
+		if *req.SubtitleLanguage != "zh-CN" && *req.SubtitleLanguage != "zh-TW" {
+			respondLocalizedError(c, http.StatusBadRequest, "字幕语言无效", "Invalid subtitle language")
+			return
+		}
+		entries["subtitle_language"] = *req.SubtitleLanguage
+	}
 	clampSize := func(n int) (string, bool) {
 		if n <= 0 {
 			return "", false
@@ -189,6 +203,9 @@ func updateConfig(c *gin.Context) {
 	}
 	if req.VideoWaterfallDefault != nil {
 		entries["video_waterfall_default"] = strconv.FormatBool(*req.VideoWaterfallDefault)
+	}
+	if req.VideoShowDirectoryBar != nil {
+		entries["video_show_directory_bar"] = strconv.FormatBool(*req.VideoShowDirectoryBar)
 	}
 	if req.JavPageSize != nil {
 		if v, ok := clampSize(*req.JavPageSize); ok {
@@ -284,6 +301,9 @@ func updateConfig(c *gin.Context) {
 	}
 	if req.JavCardPortrait != nil {
 		entries["jav_card_portrait"] = strconv.FormatBool(*req.JavCardPortrait)
+	}
+	if req.JavHighSaturationTags != nil {
+		entries["jav_high_saturation_tags"] = strconv.FormatBool(*req.JavHighSaturationTags)
 	}
 	if req.JavHideIdols != nil {
 		entries["jav_hide_idols"] = strconv.FormatBool(*req.JavHideIdols)

@@ -148,7 +148,7 @@ func TestWriteJavSidecarsUsesVideoNameForImages(t *testing.T) {
 	// 封面缓存要求大于 5KB 才算有效，纯色图会被判为占位图，这里用噪点图。
 	writeTestJPEG(t, cached, 200, 300)
 
-	result, err := writeJavSidecars(context.Background(), videoPath, &models.Jav{Code: "MIGD-641"}, coverDir)
+	result, err := writeJavSidecars(context.Background(), videoPath, &models.Jav{Code: "MIGD-641"}, coverDir, false, true)
 	if err != nil {
 		t.Fatalf("writeJavSidecars returned error: %v", err)
 	}
@@ -204,7 +204,7 @@ func TestWriteJavFanartCopiesFullCoverBesideVideo(t *testing.T) {
 	file.Close()
 
 	var result sidecarResult
-	writeJavFanart(context.Background(), base, &models.Jav{Code: "ABP-123"}, coverPath, &result)
+	writeJavFanart(context.Background(), base, &models.Jav{Code: "ABP-123"}, coverPath, true, &result)
 
 	if !result.fanartWritten {
 		t.Fatal("expected fanart to be written")
@@ -243,7 +243,7 @@ func TestWriteJavFanartRespectsDisableSwitch(t *testing.T) {
 
 	t.Setenv("JAVBOSS_POSTER_FANART", "0")
 	var result sidecarResult
-	writeJavFanart(context.Background(), base, &models.Jav{Code: "ABP-123"}, coverPath, &result)
+	writeJavFanart(context.Background(), base, &models.Jav{Code: "ABP-123"}, coverPath, true, &result)
 
 	if result.fanartWritten {
 		t.Fatal("fanart should not be written when disabled")
@@ -275,7 +275,7 @@ func TestWriteJavFanartKeepsExistingFile(t *testing.T) {
 	}
 
 	var result sidecarResult
-	writeJavFanart(context.Background(), base, &models.Jav{Code: "ABP-123"}, coverPath, &result)
+	writeJavFanart(context.Background(), base, &models.Jav{Code: "ABP-123"}, coverPath, true, &result)
 
 	if result.fanartWritten {
 		t.Fatal("existing fanart should not be overwritten")

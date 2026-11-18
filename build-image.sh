@@ -60,9 +60,33 @@ esac
 info "宿主架构 $HOST_ARCH → 目标 linux/${TARGET_ARCH}"
 
 # ---------- 构建参数 ----------
+# 展示版本：基础版本 + 构建时间 + 提交（镜像标签仍是 IMAGE_TAG，避免 tag 泛滥）。
+# 可用 APP_BUILD_VERSION=xxx 覆盖。基础版本取 git 最近 tag，取不到再读 VERSION 文件。
+resolve_app_build_version() {
+  local version="" sha=""
+  if [ -d .git ] && command -v git >/dev/null 2>&1; then
+    version="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+    version="${version#v}"
+  fi
+  if [ -z "$version" ] && [ -f VERSION ]; then
+    version="$(head -n 1 VERSION 2>/dev/null | tr -d '[:space:]')"
+    version="${version#v}"
+  fi
+  [ -n "$version" ] || version="dev"
+  version="v${version}-strm.$(date +%Y%m%d-%H%M)"
+  if [ -d .git ] && command -v git >/dev/null 2>&1; then
+    sha="$(git rev-parse --short HEAD 2>/dev/null || true)"
+    [ -n "$sha" ] && version="${version}.${sha}"
+  fi
+  printf '%s' "$version"
+}
+APP_BUILD_VERSION="${APP_BUILD_VERSION:-$(resolve_app_build_version)}"
+info "构建版本：$APP_BUILD_VERSION（镜像 javboss:${IMAGE_TAG}）"
+
 BUILD_ARGS=(
   --build-arg BUILD_MODE=release
   --build-arg "APP_VERSION=${IMAGE_TAG}"
+  --build-arg "APP_BUILD_VERSION=${APP_BUILD_VERSION}"
   --build-arg NPM_CONFIG_REGISTRY=https://registry.npmmirror.com
   --build-arg "GOPROXY=https://goproxy.cn,direct"
   --build-arg "APK_MIRROR=${APK_MIRROR:-mirrors.aliyun.com}"

@@ -23,13 +23,20 @@ import (
 	"javboss/internal/models"
 	"javboss/internal/mpv"
 	"javboss/internal/util"
+	"javboss/internal/video/metadata"
 	"javboss/internal/video/screenshot"
 	"javboss/internal/video/stream"
 )
 
 // listVideos accepts sort=watched (longest first) or watched_asc (shortest first)
 // for cumulative watch time; legacy play_count sort values are aliases.
+// directory_id selects an enabled library root. subdirectory is a relative directory
+// within that root; it includes all descendants and requires directory_id.
 func listVideos(c *gin.Context) {
+	directoryIDs, subdirectory, valid := parseVideoDirectoryFilter(c)
+	if !valid {
+		return
+	}
 	limit := queryInt(c, "limit", 100)
 	offset := queryInt(c, "offset", 0)
 	tagFilter := parseTagQuery(c.Query("tags"))
@@ -47,14 +54,14 @@ func listVideos(c *gin.Context) {
 		seed = &parsed
 	}
 
-	videos, err := dbpkg.Default().ListVideos(c.Request.Context(), limit, offset, tagFilter, search, sort, seed, nil, hideJav)
+	videos, err := dbpkg.Default().ListVideos(c.Request.Context(), limit, offset, tagFilter, search, sort, seed, directoryIDs, dbpkg.VideoFilter{HideJav: hideJav, Subdirectory: subdirectory})
 	if err != nil {
 		logging.Error("list videos error: %v", err)
 		respondLocalizedError(c, http.StatusInternalServerError, "加载视频列表失败", "Failed to load videos")
 		return
 	}
 
-	total, err := dbpkg.Default().CountVideos(c.Request.Context(), tagFilter, search, nil, hideJav)
+	total, err := dbpkg.Default().CountVideos(c.Request.Context(), tagFilter, search, directoryIDs, dbpkg.VideoFilter{HideJav: hideJav, Subdirectory: subdirectory})
 	if err != nil {
 		logging.Error("count videos error: %v", err)
 		respondLocalizedError(c, http.StatusInternalServerError, "统计视频数量失败", "Failed to count videos")
@@ -178,6 +185,7 @@ type videoJavPossibleCodesResponse struct {
 }
 
 func getVideoStreams(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
 	video, fullPath, locationID, err := resolveVideoStreamTarget(c)
 	if err != nil {
 		respondPlaybackError(c, err)
@@ -191,14 +199,17 @@ func getVideoStreams(c *gin.Context) {
 		return
 	}
 
-	probe, err := util.ProbePlaybackSupport(fullPath)
+	// 上游改为复用库里缓存的媒体信息（扫描/预览阶段已 ffprobe 过），
+	// 避免每次打开播放器都重新探测。
+	mediaInfo, err := metadata.Load(c.Request.Context(), dbpkg.Default(), video, fullPath)
 	if err != nil {
 		logging.Error("probe playback support error: %v", err)
 		respondPlaybackError(c, err)
 		return
 	}
 
-	c.JSON(http.StatusOK, buildPlaybackInfo(video, locationID, probe))
+	probe := util.AssessPlaybackSupport(mediaInfo)
+	c.JSON(http.StatusOK, buildPlaybackInfo(video, locationID, &probe))
 }
 
 // resolveStrmPlaybackTarget 解析 STRM 指针的播放目标。
@@ -282,7 +293,7 @@ func buildPlaybackInfo(video *models.Video, locationID int64, probe *util.Playba
 	if mimeType := directMimeType(probe.Container); mimeType != "" {
 		info.Sources = append(info.Sources, playbackSource{
 			Kind:     "direct",
-			Src:      buildDirectStreamURL(video, locationID),
+			Src:      buildDirectStreamURL(video),
 			MimeType: mimeType,
 			Label:    "Direct",
 		})
@@ -386,9 +397,14 @@ func streamHLSManifest(c *gin.Context) {
 		return
 	}
 
+	mediaInfo, err := metadata.Load(c.Request.Context(), dbpkg.Default(), video, fullPath)
+	if err != nil {
+		respondPlaybackError(c, err)
+		return
+	}
 	resolution := strings.TrimSpace(c.Query("resolution"))
 	c.Header("Cache-Control", "no-cache")
-	stream.ServeManifest(c.Writer, c.Request, fullPath, float64(video.DurationSec), resolution)
+	stream.ServeManifest(c.Writer, c.Request, fullPath, float64(video.DurationSec), resolution, mediaInfo)
 }
 
 func streamHLSSegment(c *gin.Context) {
@@ -398,12 +414,18 @@ func streamHLSSegment(c *gin.Context) {
 		return
 	}
 
+	mediaInfo, err := metadata.Load(c.Request.Context(), dbpkg.Default(), video, fullPath)
+	if err != nil {
+		respondPlaybackError(c, err)
+		return
+	}
 	segment := strings.TrimSpace(c.Param("segment"))
 	resolution := strings.TrimSpace(c.Query("resolution"))
 	c.Header("Cache-Control", "no-cache")
 	stream.ServeSegment(c.Writer, c.Request, stream.Options{
 		StreamType: stream.StreamTypeHLS,
 		SourcePath: fullPath,
+		MediaInfo:  mediaInfo,
 		Duration:   float64(video.DurationSec),
 		Resolution: resolution,
 		Key:        streamCacheKey(video.ID, locationID),
@@ -411,6 +433,8 @@ func streamHLSSegment(c *gin.Context) {
 	})
 }
 
+// resolveStreamPathFromLocationQuery 按 video id + location_id 解析直连路径。
+// 只读视频位置表，不触发媒体信息探测，供 Range 请求快速取路径。
 func resolveStreamPathFromLocationQuery(c *gin.Context) (string, error) {
 	videoID, err := strconv.ParseInt(strings.TrimSpace(c.Param("id")), 10, 64)
 	if err != nil || videoID <= 0 {
@@ -444,32 +468,23 @@ func resolveVideoStreamTarget(c *gin.Context) (*models.Video, string, int64, err
 		return nil, "", 0, errors.New("invalid id")
 	}
 
-	video, err := dbpkg.Default().GetVideo(c.Request.Context(), id)
+	locationID, err := parseLocationIDQuery(c)
+	if err != nil {
+		return nil, "", 0, err
+	}
+
+	video, err := dbpkg.Default().GetVideoForPlayback(c.Request.Context(), id, locationID)
 	if err != nil {
 		return nil, "", 0, err
 	}
 	if video == nil {
 		return nil, "", 0, os.ErrNotExist
 	}
-
-	locationID, err := parseLocationIDQuery(c)
+	fullPath, _, err := resolveVideoPath(video.Path, video.DirectoryRef.Path)
 	if err != nil {
 		return nil, "", 0, err
 	}
-
-	var fullPath string
-	if locationID > 0 {
-		fullPath, err = resolveStreamPathFromLocationQuery(c)
-	} else {
-		fullPath, err = resolveVideoPrimaryPath(c.Request.Context(), video)
-	}
-	if err != nil {
-		return nil, "", 0, err
-	}
-	if _, err := os.Stat(fullPath); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, "", 0, err
-		}
+	if _, err := metadata.CheckFile(fullPath, video.Size, video.ModifiedAt); err != nil {
 		return nil, "", 0, err
 	}
 
@@ -489,6 +504,7 @@ func parseLocationIDQuery(c *gin.Context) (int64, error) {
 }
 
 func respondPlaybackError(c *gin.Context, err error) {
+	c.Header("Cache-Control", "no-store")
 	switch {
 	case err == nil:
 		return
@@ -496,6 +512,8 @@ func respondPlaybackError(c *gin.Context, err error) {
 		respondLocalizedError(c, http.StatusNotFound, "视频文件或所在目录不存在", "Video file or directory does not exist")
 	case errors.Is(err, context.Canceled):
 		c.Status(499)
+	case errors.Is(err, metadata.ErrFileChanged):
+		respondLocalizedError(c, http.StatusConflict, "视频文件已修改，请重新扫描所在目录后再播放", "The video file has changed. Rescan its directory before playing.")
 	case strings.Contains(err.Error(), "ffmpeg not found"), strings.Contains(err.Error(), "ffprobe not found"):
 		respondLocalizedError(c, http.StatusServiceUnavailable, "缺少网页播放器所需组件", err.Error())
 	case strings.Contains(err.Error(), "browser playback is not supported"):
@@ -524,15 +542,16 @@ func directMimeType(container string) string {
 	}
 }
 
-func buildDirectStreamURL(video *models.Video, locationID int64) string {
+func buildDirectStreamURL(video *models.Video) string {
 	if video == nil {
 		return ""
 	}
 	streamURL := "/videos/" + strconv.FormatInt(video.ID, 10) + "/stream"
-	if locationID > 0 {
-		streamURL += "?location_id=" + strconv.FormatInt(locationID, 10)
+	query := url.Values{
+		"path":     {video.Path},
+		"dir_path": {video.DirectoryRef.Path},
 	}
-	return streamURL
+	return streamURL + "?" + query.Encode()
 }
 
 func buildHLSStreamURL(video *models.Video, locationID int64) string {
@@ -625,10 +644,13 @@ func playVideoFile(c *gin.Context) {
 		dataDir = filepath.Dir(cfg.DatabasePath)
 	}
 	if err := mpv.PlayVideo(fullPath, mpv.PlayOptions{
-		NewWatchReporter: localPlaybackReporter(videoID, 0, dirPath, fullPath),
-		DataDir:          dataDir,
-		VideoID:          videoID,
-		StartTimeSec:     req.StartTimeSec,
+		NewWatchReporter:      localPlaybackReporter(videoID, 0, dirPath, fullPath),
+		ResolveSubtitle:       localSubtitleResolver(videoID, 0, fullPath),
+		SaveSubtitleOffset:    localSubtitleOffsetSaver(videoID),
+		SaveSubtitleSelection: localSubtitleSelectionSaver(videoID),
+		DataDir:               dataDir,
+		VideoID:               videoID,
+		StartTimeSec:          req.StartTimeSec,
 	}); err != nil {
 		logging.Error("play video file error: %v", err)
 		if strings.Contains(err.Error(), "mpv not found") {
@@ -726,9 +748,12 @@ func playVideoPlaylist(c *gin.Context) {
 				}
 			},
 			Options: mpv.PlayOptions{
-				NewWatchReporter: localPlaybackReporter(videoID, location.ID, "", ""),
-				DataDir:          dataDir,
-				VideoID:          requested.VideoID,
+				NewWatchReporter:      localPlaybackReporter(videoID, location.ID, "", ""),
+				ResolveSubtitle:       localSubtitleResolver(videoID, location.ID, fullPath),
+				SaveSubtitleOffset:    localSubtitleOffsetSaver(videoID),
+				SaveSubtitleSelection: localSubtitleSelectionSaver(videoID),
+				DataDir:               dataDir,
+				VideoID:               requested.VideoID,
 			},
 		})
 	}
@@ -1496,7 +1521,7 @@ func incrementPlayCountByPath(ctx context.Context, dirPath, fullPath string) {
 		return
 	}
 	relPath = filepath.ToSlash(filepath.Clean(relPath))
-	if relPath == "." || strings.HasPrefix(relPath, "..") {
+	if relPath == "." || relPath == ".." || strings.HasPrefix(relPath, "../") {
 		return
 	}
 	if err := dbpkg.Default().IncrementVideoPlayCountByPath(ctx, dirPath, relPath); err != nil {
@@ -1525,7 +1550,7 @@ func resolvePlaybackVideoID(ctx context.Context, requestedID int64, dirPath, ful
 		return 0
 	}
 	relPath = filepath.ToSlash(filepath.Clean(relPath))
-	if relPath == "." || strings.HasPrefix(relPath, "..") {
+	if relPath == "." || relPath == ".." || strings.HasPrefix(relPath, "../") {
 		return 0
 	}
 	videoID, err := dbpkg.Default().GetVideoIDByPath(ctx, dirPath, relPath)

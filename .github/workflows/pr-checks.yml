@@ -87,9 +87,13 @@ jobs:
         run: go test -count=1 -timeout=2m -ldflags="-H windowsgui" ./internal/api ./cmd/server -run '^Test(HTTPShutdownEndsWatchedTimeStreams|RunClientErrorCleansUpPlayers)$'
 
   frontend:
-    name: Frontend checks
+    name: Frontend checks (shard ${{ matrix.shard }}/2)
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     env:
       CHROME_BIN: /usr/bin/google-chrome
     defaults:
@@ -117,16 +121,19 @@ jobs:
           node --input-type=module -e "import assert from 'node:assert/strict'; assert.equal(typeof WebSocket, 'function');"
 
       - name: Lint frontend
+        if: matrix.shard == 1
         run: npm run lint
 
       - name: Check frontend formatting
+        if: matrix.shard == 1
         run: npm run format:check
 
       - name: Test frontend, including browser tests
-        # Avoid starting several Chrome/Vite instances at once on the runner.
-        run: npm test -- --test-concurrency=1 --test-reporter=tap
+        # Run shards on separate runners; keep Chrome/Vite serial within each shard.
+        run: npm test -- --test-shard=${{ matrix.shard }}/2 --test-concurrency=1 --test-reporter=tap
 
       - name: Build frontend
+        if: matrix.shard == 1
         run: npm run build
 
   tooling:
@@ -150,10 +157,11 @@ jobs:
         working-directory: scripts/cli
         run: npm ci
 
-      - name: Verify release test prerequisites
+      - name: Verify release and installer test prerequisites
         run: |
           command -v zip
           command -v unzip
+          command -v pwsh
 
       - name: Test CLI
         working-directory: scripts/cli
@@ -163,7 +171,24 @@ jobs:
         working-directory: scripts/cli
         run: npm run build
 
+      # Branded Chrome no longer supports --load-extension. Use the testing
+      # build explicitly so these tests actually load the unpacked extension.
+      - name: Setup Chrome for extension tests
+        id: extension-chrome
+        uses: browser-actions/setup-chrome@v2
+        with:
+          chrome-version: stable
+
+      - name: Verify extension browser test prerequisites
+        env:
+          CHROME_BIN: ${{ steps.extension-chrome.outputs.chrome-path }}
+        run: |
+          "$CHROME_BIN" --version
+          node -e "const assert = require('node:assert/strict'); assert.ok(require('node:fs').existsSync(process.env.CHROME_BIN)); assert.equal(typeof WebSocket, 'function');"
+
       - name: Test browser extension
+        env:
+          CHROME_BIN: ${{ steps.extension-chrome.outputs.chrome-path }}
         run: node --test browser-extension/tests/*.test.js
 
   merge-check:

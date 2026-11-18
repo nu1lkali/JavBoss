@@ -15,6 +15,8 @@ services:
       args:
         BUILD_MODE: release
         APP_VERSION: ${APP_VERSION:-strm-local}
+        # 仅用于页面展示的版本号（v基础版本-strm.构建时间.提交）。留空则退回 APP_VERSION。
+        APP_BUILD_VERSION: ${APP_BUILD_VERSION:-}
         NPM_CONFIG_REGISTRY: ${NPM_CONFIG_REGISTRY:-https://registry.npmmirror.com}
         GOPROXY: ${GOPROXY:-https://goproxy.cn,direct}
         GOSUMDB: ${GOSUMDB:-sum.golang.org}

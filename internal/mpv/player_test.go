@@ -68,11 +68,25 @@ func TestBuildLoadFileCommandReplacesCurrentFile(t *testing.T) {
 	}
 	expected := []any{"loadfile", "/videos/a.mp4", "replace", -1, map[string]string{
 		"start":                "12.345",
+		"sub-delay":            "0",
 		"screenshot-directory": filepath.Join(dataDir, "video", "42", "screenshot"),
 		"screenshot-template":  playbackScreenshotTemplate,
 	}}
 	if !reflect.DeepEqual(command, expected) {
 		t.Fatalf("expected loadfile command %v, got %v", expected, command)
+	}
+}
+
+func TestBuildLoadFileCommandPreservesTitle(t *testing.T) {
+	const title = "中文 {测试} 100%.mp4"
+	command, err := buildLoadFileCommand("http://127.0.0.1/__client/media/random-token", PlayOptions{
+		Title: title, DataDir: t.TempDir(), VideoID: 42,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := command[4].(map[string]string)["force-media-title"]; got != title {
+		t.Fatalf("force-media-title = %q, want %q", got, title)
 	}
 }
 
@@ -98,6 +112,7 @@ func TestBuildPlaylistLoadFileCommandUsesPerFileScreenshotDirectory(t *testing.T
 			"screenshot-directory": filepath.Join(dataDir, "video", "84", "screenshot"),
 			"screenshot-template":  playbackScreenshotTemplate,
 			"start":                "2.5",
+			"sub-delay":            "0",
 		},
 	}
 	if !reflect.DeepEqual(command, expected) {

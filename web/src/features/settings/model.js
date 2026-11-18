@@ -17,6 +17,7 @@ export function createVideoSettingsDraft(state) {
     videoSortInput: sortOrder,
     videoHideJavInput: videoHideJav,
     videoWaterfallDefaultInput: configFlag(config?.video_waterfall_default),
+    videoShowDirectoryBarInput: configFlag(config?.video_show_directory_bar, true),
   }
 }
 
@@ -26,6 +27,7 @@ const javSettingsFieldsByTab = {
     'javPageSizeInput',
     'javGridColumnsInput',
     'javCardPortraitInput',
+    'javHighSaturationTagsInput',
     'javTitleMaxRowsInput',
     'javIdolTagMaxRowsInput',
     'javTagMaxRowsInput',
@@ -72,6 +74,7 @@ export function createJavSettingsDraft(state, tab) {
     javPageSizeInput: javPageSize,
     javGridColumnsInput: javGridColumns,
     javCardPortraitInput: configFlag(config?.jav_card_portrait, true),
+    javHighSaturationTagsInput: configFlag(config?.jav_high_saturation_tags, true),
     javTitleMaxRowsInput: javTitleMaxRows,
     javIdolTagMaxRowsInput: javIdolTagMaxRows,
     javTagMaxRowsInput: javTagMaxRows,

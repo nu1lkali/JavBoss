@@ -10,7 +10,7 @@ export const browserUnavailable = !existsSync(chromePath) || typeof WebSocket ==
 
 export async function openBrowser(
   t,
-  { cacheDir = 'node_modules/.vite-app-test', plugins = [] } = {}
+  { cacheDir = 'node_modules/.vite-app-test', plugins = [], chromeArgs = [] } = {}
 ) {
   const root = fileURLToPath(new URL('../../', import.meta.url))
   const server = await createServer({
@@ -42,7 +42,7 @@ export async function openBrowser(
   await server.listen()
   t.after(() => server.close())
   const origin = `http://127.0.0.1:${server.httpServer.address().port}`
-  const { port } = await startChrome(t)
+  const { port } = await startChrome(t, { args: chromeArgs })
   const target = await (
     await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, { method: 'PUT' })
   ).json()
@@ -64,6 +64,13 @@ export async function openBrowser(
       pending.set(id, resolve)
       socket.send(JSON.stringify({ id, method, params }))
     })
+  // Fixtures assert English UI text. Pin the browser language instead of
+  // inheriting the developer's OS language (Chrome on macOS ignores --lang).
+  const { result: browserVersion } = await command('Browser.getVersion')
+  await command('Emulation.setUserAgentOverride', {
+    userAgent: browserVersion.userAgent,
+    acceptLanguage: 'en-US,en',
+  })
   const evaluate = async (expression) => {
     const reply = await command('Runtime.evaluate', {
       expression,

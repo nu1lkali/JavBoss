@@ -33,6 +33,9 @@ PORT=""
 UPGRADE_ONLY=0
 STATUS_ONLY=0
 SKIP_BUILD=0
+# 只有进程环境里显式给出才算「用户指定」；.env 里不会持久化它，
+# 否则每次重建都会把上一次的构建串当成固定值沿用下来。
+APP_BUILD_VERSION_ENV="${APP_BUILD_VERSION:-}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -135,6 +138,50 @@ fi
 APP_VERSION="${APP_VERSION:-strm-local}"
 TZ="${TZ:-Asia/Shanghai}"
 
+# ---------- 展示版本号 ----------
+# 页面「版本」原来固定显示 strm-local，看不出跑的是哪一份代码。
+# 这里改成 基础版本 + 分支标记 + 构建时间 + 提交：
+#   v2.1.6-strm.20261026-1103.a1b2c3d（工作树有改动时再加 -dirty）
+# 镜像标签仍然固定用 APP_VERSION，避免每次重建都堆一个新 tag 占满 NAS 磁盘。
+# 基础版本优先取 git 最近的 tag；源码里没有 .git（或没装 git）时读根目录 VERSION 文件。
+base_version() {
+  local version=""
+  if [ -d "$SCRIPT_DIR/.git" ] && command -v git >/dev/null 2>&1; then
+    version="$(git -C "$SCRIPT_DIR" describe --tags --abbrev=0 2>/dev/null || true)"
+    version="${version#v}"
+  fi
+  if [ -z "$version" ] && [ -f "$SCRIPT_DIR/VERSION" ]; then
+    version="$(head -n 1 "$SCRIPT_DIR/VERSION" 2>/dev/null | tr -d '[:space:]')"
+    version="${version#v}"
+  fi
+  [ -n "$version" ] || version="dev"
+  printf '%s' "$version"
+}
+
+resolve_app_build_version() {
+  local version sha=""
+  version="v$(base_version)-strm.$(date +%Y%m%d-%H%M)"
+  if [ -d "$SCRIPT_DIR/.git" ] && command -v git >/dev/null 2>&1; then
+    sha="$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || true)"
+    if [ -n "$sha" ]; then
+      version="${version}.${sha}"
+      # 源码是直接 rsync 上来（带 .git 但工作树脏）时标记 dirty，
+      # 避免把「不是这次提交的代码」当成干净构建。
+      if ! git -C "$SCRIPT_DIR" diff --quiet 2>/dev/null; then
+        version="${version}-dirty"
+      fi
+    fi
+  fi
+  printf '%s' "$version"
+}
+
+if [ -n "$APP_BUILD_VERSION_ENV" ]; then
+  APP_BUILD_VERSION="$APP_BUILD_VERSION_ENV"
+else
+  APP_BUILD_VERSION="$(resolve_app_build_version)"
+fi
+info "构建版本：$APP_BUILD_VERSION（镜像标签 javboss:$APP_VERSION）"
+
 # 群晖上目录属主通常是 admin(1026)、用户自身 UID 或 root，取媒体目录的属主最稳妥。
 PUID="${PUID:-$(stat -c '%u' "$MEDIA_DIR" 2>/dev/null || echo 1000)}"
 PGID="${PGID:-$(stat -c '%g' "$MEDIA_DIR" 2>/dev/null || echo 1000)}"
@@ -197,6 +244,7 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
   BUILD_ARGS=(
     --build-arg BUILD_MODE=release
     --build-arg "APP_VERSION=${APP_VERSION}"
+    --build-arg "APP_BUILD_VERSION=${APP_BUILD_VERSION}"
     --build-arg "NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY:-https://registry.npmmirror.com}"
     --build-arg "GOPROXY=${GOPROXY:-https://goproxy.cn,direct}"
     --build-arg "GOSUMDB=${GOSUMDB:-sum.golang.org}"
@@ -257,6 +305,12 @@ else
   warn "  cd \"$DEPLOY_DIR\" && $COMPOSE logs --tail=100 javboss"
 fi
 echo "  访问地址 : http://${IP}:${JAVBOSS_PORT}"
+# 版本以镜像标签为准：--no-build 导入的镜像也能读出真实构建串。
+IMAGE_VERSION="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "javboss:${APP_VERSION}" 2>/dev/null || true)"
+if [ -z "$IMAGE_VERSION" ] || [ "$IMAGE_VERSION" = "<no value>" ]; then
+  IMAGE_VERSION="$APP_BUILD_VERSION"
+fi
+echo "  构建版本 : ${IMAGE_VERSION}"
 echo "  媒体目录 : ${MEDIA_DIR}  ->  容器内 ${MEDIA_DIR_IN_CONTAINER}（可写，需要生成 NFO/封面）"
 echo "  数据目录 : ${DATA_DIR}"
 echo

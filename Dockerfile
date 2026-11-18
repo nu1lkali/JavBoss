@@ -38,6 +38,9 @@ ARG GOPROXY=https://goproxy.cn,direct
 ARG GOSUMDB=sum.golang.org
 ARG BUILD_MODE=release
 ARG APP_VERSION=dev
+# 展示用版本号：deploy-synology.sh 会传「基础版本 + 构建时间 + 提交」这种具体串，
+# 页面上的版本号取的就是它。不传时退回 APP_VERSION（保持老构建方式的行为）。
+ARG APP_BUILD_VERSION=
 # sqlite 需要 cgo；显式打开并设置好 CGO_ENABLED/CC，
 # 避免不同 golang 基础镜像默认值不一致导致 "conn.Exec undefined" 之类的怪错误。
 ARG CGO_ENABLED=1
@@ -56,11 +59,16 @@ RUN set -eux; \
   go version; \
   gcc --version | head -n 1; \
   go env CGO_ENABLED CC GOARCH GOOS
-RUN go build -trimpath -ldflags="-s -w -X main.buildMode=${BUILD_MODE} -X javboss/internal/common.Version=${APP_VERSION}" -o /out/javboss ./cmd/server && \
+RUN go build -trimpath -ldflags="-s -w -X main.buildMode=${BUILD_MODE} -X javboss/internal/common.Version=${APP_BUILD_VERSION:-${APP_VERSION}}" -o /out/javboss ./cmd/server && \
   ls -lh /out/javboss
 
 # 运行时基础镜像：debian:bookworm-slim，与 go-build 同为 glibc，cgo 产物可直接运行。
 FROM ${RUNTIME_IMAGE}
+
+# 把展示版本写进镜像标签，部署脚本/运维可以直接 inspect 出「这是哪一次构建」，
+# 即使是用 --no-build 导入的镜像也能看到。
+ARG APP_BUILD_VERSION=
+LABEL org.opencontainers.image.version="$APP_BUILD_VERSION"
 
 # FFmpeg 用 apt 从软件源安装，不走 GitHub（GitHub Releases 在国内经常超时）。
 # APT_MIRROR 可覆盖为国内镜像，例如阿里云：

@@ -1,4 +1,5 @@
 import Tooltip from '@/shared/ui/Tooltip'
+import VideoDirectoryFilter from '@/features/video/components/VideoDirectoryFilter'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import LibraryAddCheckOutlinedIcon from '@mui/icons-material/LibraryAddCheckOutlined'
 import CloseRoundedIcon from '@mui/icons-material/CloseRounded'
@@ -9,6 +10,7 @@ import FavoriteRoundedIcon from '@mui/icons-material/FavoriteRounded'
 import FolderOutlinedIcon from '@mui/icons-material/FolderOutlined'
 import FolderRoundedIcon from '@mui/icons-material/FolderRounded'
 import SearchIcon from '@mui/icons-material/Search'
+import LocalOfferOutlinedIcon from '@mui/icons-material/LocalOfferOutlined'
 import SettingsOutlinedIcon from '@mui/icons-material/SettingsOutlined'
 import ShuffleOutlinedIcon from '@mui/icons-material/ShuffleOutlined'
 import { Button, IconButton, Menu, MenuItem, Popper, Slider } from '@mui/material'
@@ -388,6 +390,7 @@ export default function TopBar({
   onRandomClick,
   onOpenFavoriteGroups,
   onOpenFilterEditor,
+  onOpenVideoTags,
   onOpenFavoriteManager,
   onSearchInputChange,
   onSubmitSearch,
@@ -425,19 +428,6 @@ export default function TopBar({
         return zh('系列收藏夹', 'Series favorites')
       default:
         return zh('女优收藏夹', 'Idol favorites')
-    }
-  }, [favoriteEntityType])
-
-  const favoriteAllLabel = useMemo(() => {
-    switch (favoriteEntityType) {
-      case 'jav':
-        return zh('全部作品', 'All JAV')
-      case 'studio':
-        return zh('全部片商', 'All studios')
-      case 'series':
-        return zh('全部系列', 'All series')
-      default:
-        return zh('全部女优', 'All idols')
     }
   }, [favoriteEntityType])
 
@@ -512,10 +502,15 @@ export default function TopBar({
           JavBoss
         </button>
         <div className="filter-topbar__controls">
+          {!isJavMode ? (
+            <div className="relative -ml-1 mr-4 shrink-0 border-r border-slate-200 pr-4 dark:border-ui-border">
+              <VideoDirectoryFilter />
+            </div>
+          ) : null}
           {isJavMode && !isJavDownload ? (
             <div
               ref={favoriteMenuRef}
-              className="relative -ml-1 mr-4 shrink-0 border-r border-slate-200 pr-4"
+              className="relative -ml-1 mr-4 shrink-0 border-r border-slate-200 pr-4 dark:border-ui-border"
             >
               <button
                 type="button"
@@ -541,7 +536,6 @@ export default function TopBar({
               {favoriteMenuOpen ? (
                 <FavoriteGroupMenu
                   title={favoriteLabel}
-                  allLabel={favoriteAllLabel}
                   groups={favoriteGroups}
                   selectedGroupId={selectedFavoriteGroupId}
                   loading={favoriteGroupsLoading}
@@ -557,8 +551,9 @@ export default function TopBar({
             </div>
           ) : null}
           {!isJavDownload ? (
-            <form onSubmit={onSubmitSearch} className="filter-search">
+            <form onSubmit={onSubmitSearch} className="filter-search form-field-group">
               <input
+                className="form-field-input"
                 value={activeSearchInput}
                 onChange={(event) => onSearchInputChange?.(event.target.value)}
                 placeholder={placeholder}
@@ -581,6 +576,18 @@ export default function TopBar({
                 <SearchIcon sx={{ fontSize: 17 }} />
               </Button>
             </form>
+          ) : null}
+
+          {!isJavMode ? (
+            <button
+              type="button"
+              className="filter-action-button"
+              onClick={onOpenVideoTags}
+              aria-label={zh('标签', 'Tags')}
+            >
+              <LocalOfferOutlinedIcon fontSize="small" />
+              <span>{zh('标签', 'Tags')}</span>
+            </button>
           ) : null}
 
           {isJavMode && javTab === 'list' ? (
@@ -647,7 +654,7 @@ export default function TopBar({
               <div
                 role="group"
                 aria-label={zh('多选', 'Multiple selection')}
-                className="inline-flex flex-wrap items-center gap-1 rounded-full border border-sky-100 bg-sky-50 px-1.5 py-1"
+                className="inline-flex flex-wrap items-center gap-1 rounded-full border border-sky-100 bg-sky-50 px-1.5 py-1 dark:border-sky-800 dark:bg-sky-950"
               >
                 <SelectionMenu
                   onSelectPage={onSelectPage}
@@ -658,7 +665,7 @@ export default function TopBar({
                   allAvailable={selectionAllAvailable}
                   busy={selectionBusy}
                 />
-                <span className="whitespace-nowrap px-1.5 text-xs font-medium text-sky-700">
+                <span className="whitespace-nowrap px-1.5 text-xs font-medium text-sky-700 dark:text-sky-300">
                   {zh(`已选 ${activeSelectedCount} 项`, `${activeSelectedCount} selected`)}
                 </span>
                 <Button
@@ -689,7 +696,6 @@ export default function TopBar({
 
 function FavoriteGroupMenu({
   title,
-  allLabel,
   groups,
   selectedGroupId,
   loading,
@@ -705,22 +711,33 @@ function FavoriteGroupMenu({
     <div
       role="dialog"
       aria-label={title || zh('女优收藏夹', 'Idol favorites')}
-      className="absolute left-0 top-full z-50 mt-2.5 flex max-h-[70vh] w-[34rem] max-w-[calc(100vw-8rem)] flex-col overflow-visible rounded border border-gray-200 bg-white text-left shadow-xl"
+      className="absolute left-0 top-full z-50 mt-2.5 flex max-h-[70vh] w-[34rem] max-w-[calc(100vw-8rem)] flex-col overflow-visible rounded border border-gray-200 bg-white text-left shadow-xl dark:border-ui-border dark:bg-ui-surface"
     >
       <span
-        className="absolute left-4 top-0 h-0 w-0 -translate-y-full border-x-[10px] border-b-[10px] border-x-transparent border-b-gray-200"
+        className="absolute left-4 top-0 h-0 w-0 -translate-y-full border-x-[10px] border-b-[10px] border-x-transparent border-b-gray-200 dark:border-b-ui-border"
         aria-hidden="true"
       />
       <span
-        className="absolute left-[17px] top-px h-0 w-0 -translate-y-full border-x-[9px] border-b-[9px] border-x-transparent border-b-gray-50"
+        className="absolute left-[17px] top-px h-0 w-0 -translate-y-full border-x-[9px] border-b-[9px] border-x-transparent border-b-white dark:border-b-ui-surface"
         aria-hidden="true"
       />
-      <div className="flex items-center justify-between gap-2 border-b bg-gray-50 px-3 py-2">
+      <div className="flex items-center justify-between gap-2 border-b bg-white px-3 py-2 dark:bg-ui-surface">
         <div className="min-w-0">
-          <div className="text-xs font-semibold text-gray-700">
-            {title || zh('女优收藏夹', 'Idol favorites')}
+          <div className="flex min-h-[21px] items-center gap-1 text-xs leading-4">
+            <span className="font-semibold text-gray-700 dark:text-ui-secondary">
+              {title || zh('女优收藏夹', 'Idol favorites')}
+            </span>
+            {selected ? (
+              <button
+                type="button"
+                onClick={() => onSelect?.(null)}
+                className="relative top-px shrink-0 rounded px-1.5 font-medium text-ui-primary hover:bg-blue-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-ui-primary dark:text-blue-300 dark:hover:bg-ui-blue-hover"
+              >
+                {zh('取消筛选', 'Clear filter')}
+              </button>
+            ) : null}
           </div>
-          <div className="truncate text-xs text-gray-500">
+          <div className="truncate text-xs text-gray-500 dark:text-ui-faint">
             {loading
               ? zh('加载中…', 'Loading...')
               : zh(`${list.length} 个收藏夹`, `${list.length} favorites`)}
@@ -737,19 +754,13 @@ function FavoriteGroupMenu({
           <SettingsOutlinedIcon sx={{ fontSize: 18 }} />
         </IconButton>
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto bg-slate-50/80 p-2">
+      <div className="min-h-0 flex-1 overflow-y-auto bg-white p-2 dark:bg-ui-surface">
         {error ? (
-          <div className="mb-2 rounded border border-red-200 bg-red-50 px-2 py-1.5 text-xs text-red-700">
+          <div className="mb-2 rounded border border-red-200 bg-red-50 px-2 py-1.5 text-xs text-red-700 dark:border-red-800 dark:bg-red-950 dark:text-red-300">
             {String(error)}
           </div>
         ) : null}
         <div className="grid grid-cols-[repeat(auto-fill,minmax(5.75rem,1fr))] gap-2">
-          <FavoriteGroupTile
-            active={!selected}
-            href={buildGroupUrl?.(null)}
-            label={allLabel || zh('全部女优', 'All idols')}
-            onClick={() => onSelect?.(null)}
-          />
           {list.map((group) => {
             const id = Number(group?.id)
             if (!Number.isFinite(id) || id <= 0) return null
@@ -769,7 +780,7 @@ function FavoriteGroupMenu({
           })}
         </div>
         {!loading && !error && list.length === 0 ? (
-          <div className="px-3 py-4 text-center text-sm text-gray-500">
+          <div className="px-3 py-4 text-center text-sm text-gray-500 dark:text-ui-faint">
             {zh('暂无收藏夹', 'No favorites')}
           </div>
         ) : null}
@@ -782,7 +793,9 @@ function FavoriteGroupTile({ active, href, group = null, label, count, onClick, 
   return (
     <div
       className={`group relative block aspect-square overflow-hidden rounded-lg border focus:outline-none ${
-        active ? 'border-amber-300 shadow-md' : 'border-blue-200/80 shadow-sm'
+        active
+          ? 'border-blue-300 bg-blue-50 shadow-md dark:border-blue-500 dark:bg-ui-hover'
+          : 'border-transparent bg-transparent'
       }`}
     >
       <a
@@ -795,51 +808,31 @@ function FavoriteGroupTile({ active, href, group = null, label, count, onClick, 
         className="relative block h-full focus:outline-none"
       >
         <span
-          className={`absolute left-2 top-1.5 h-3 w-10 rounded-t-md border border-b-0 ${
-            active
-              ? 'border-amber-300 bg-gradient-to-b from-amber-200 to-amber-300'
-              : 'border-blue-200 bg-gradient-to-b from-blue-100 to-blue-200'
-          }`}
+          className="absolute left-2 top-1.5 h-3 w-10 rounded-t-md border border-b-0 border-blue-300 bg-gradient-to-b from-blue-200 to-blue-300 dark:border-blue-500 dark:bg-blue-500 dark:bg-none"
           aria-hidden="true"
         />
         <span
-          className={`absolute inset-x-1.5 bottom-1.5 top-3.5 rounded-md border shadow-[inset_0_1px_0_rgba(255,255,255,0.8),0_6px_10px_rgba(15,23,42,0.11)] ${
-            active
-              ? 'border-amber-300 bg-gradient-to-br from-amber-100 via-amber-200 to-amber-300'
-              : 'border-blue-200 bg-gradient-to-br from-blue-50 via-blue-100 to-blue-200'
-          }`}
+          className="absolute inset-x-1.5 bottom-1.5 top-3.5 rounded-md border border-blue-300 bg-gradient-to-br from-blue-100 via-blue-200 to-blue-300 shadow-[inset_0_1px_0_rgba(255,255,255,0.8),0_6px_10px_rgba(15,23,42,0.11)] dark:border-blue-500 dark:bg-blue-500 dark:bg-none dark:shadow-none"
           aria-hidden="true"
         />
         <span
-          className={`absolute inset-x-2 bottom-0.5 h-1.5 rounded-b-md ${
-            active ? 'bg-amber-400/40' : 'bg-blue-300/45'
-          }`}
+          className="absolute inset-x-2 bottom-0.5 h-1.5 rounded-b-md bg-blue-300/45 dark:hidden"
           aria-hidden="true"
         />
         <span className="relative flex h-full px-2 pt-5">
           <span className="flex items-start gap-1">
             <FolderRoundedIcon
               sx={{ fontSize: 14 }}
-              className={active ? 'shrink-0 text-amber-700' : 'shrink-0 text-blue-700'}
+              className="shrink-0 text-ui-primary-hover dark:text-blue-300"
             />
-            <span
-              className={`min-w-0 flex-1 truncate text-[11px] font-semibold leading-4 ${
-                active ? 'text-amber-950' : 'text-blue-950'
-              }`}
-            >
+            <span className="min-w-0 flex-1 truncate text-[11px] font-semibold leading-4 text-blue-950 dark:text-ui-text">
               {label}
             </span>
           </span>
         </span>
       </a>
       {Number.isFinite(count) ? (
-        <span
-          className={`absolute right-1.5 top-1.5 rounded-full border px-1.5 text-[10px] leading-4 shadow-sm ${
-            active
-              ? 'border-amber-200 bg-white/80 text-amber-700'
-              : 'border-blue-200 bg-white/80 text-blue-800'
-          }`}
-        >
+        <span className="absolute right-1.5 top-1.5 rounded-full border border-blue-200 bg-white/80 px-1.5 text-[10px] leading-4 text-ui-primary-hover shadow-sm dark:border-ui-blue-border dark:bg-ui-surface dark:text-blue-300">
           {count}
         </span>
       ) : null}
@@ -851,11 +844,7 @@ function FavoriteGroupTile({ active, href, group = null, label, count, onClick, 
             event.stopPropagation()
             onEdit?.()
           }}
-          className={`absolute bottom-1.5 right-1.5 inline-flex h-5 w-5 items-center justify-center rounded border bg-white/85 shadow-sm backdrop-blur-sm transition-colors ${
-            active
-              ? 'border-amber-200 text-amber-700 hover:bg-amber-50'
-              : 'border-blue-200 text-blue-800 hover:bg-blue-50'
-          }`}
+          className="absolute bottom-1.5 right-1.5 inline-flex h-5 w-5 items-center justify-center rounded border border-blue-200 bg-white/85 text-ui-primary-hover shadow-sm backdrop-blur-sm transition-colors hover:bg-blue-50 dark:border-ui-blue-border dark:bg-ui-surface dark:text-blue-300 dark:hover:bg-ui-blue-hover"
           aria-label={zh(`编辑收藏夹 ${label}`, `Edit favorite ${label}`)}
         >
           <EditRoundedIcon sx={{ fontSize: 14 }} />

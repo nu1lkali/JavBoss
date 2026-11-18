@@ -8,7 +8,7 @@ test(
   async (t) => {
     const { origin, command, evaluate, waitFor } = await openBrowser(t)
     await command('Page.navigate', { url: `${origin}/tests/fixtures/app.html?view=video` })
-    await waitFor(`document.querySelector('aside button[aria-label="Tags (Video)"]')`)
+    await waitFor(`document.querySelector('header button[aria-label="Tags"]')`)
     await evaluate(`{
       const originalFetch = window.fetch;
       window.fetch = (input, init) => new URL(input, location.origin).pathname === '/tags'
@@ -16,14 +16,31 @@ test(
             id: i + 1, name: 'Example tag ' + (i + 1), count: 24 - i
           }))))
         : originalFetch(input, init);
-      document.querySelector('aside button[aria-label="Tags (Video)"]').click();
+      document.querySelector('header button[aria-label="Tags"]').click();
     }`)
     await waitFor(
       `document.querySelectorAll('.tag-management-modal-list .skeuo-tag').length === 24`
     )
+    // Empty titles must not retain hover state that becomes visible on entering edit mode.
+    for (const index of [0, 1, 2, 3]) {
+      const point = await evaluate(`(() => {
+        const rect = document.querySelectorAll('.skeuo-tag-main')[${index}].getBoundingClientRect();
+        return {x: rect.x + rect.width / 2, y: rect.y + rect.height / 2};
+      })()`)
+      await command('Input.dispatchMouseEvent', { type: 'mouseMoved', ...point })
+      await evaluate('new Promise(resolve => setTimeout(resolve, 150))')
+    }
+    await command('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 0, y: 0 })
+    await evaluate('new Promise(resolve => setTimeout(resolve, 150))')
     await evaluate(`Array.from(document.querySelectorAll('[role="dialog"] button'))
       .find(button => button.textContent === 'Edit').click()`)
     await waitFor(`document.querySelector('.skeuo-tag--edit-mode')`)
+    await evaluate('new Promise(resolve => setTimeout(resolve, 400))')
+    assert.equal(
+      await evaluate(`document.querySelectorAll('[role="tooltip"]').length`),
+      0,
+      'entering edit mode must not show tooltips for previously hovered tags'
+    )
     assert.equal(
       await evaluate(
         `document.querySelectorAll('.tag-management-modal-list button[aria-label="Delete tag"]').length`
@@ -102,6 +119,24 @@ test(
       0,
       'delete actions are hidden outside edit mode'
     )
+    await evaluate(`document.querySelector('[aria-label="Close tag management"]').click()`)
+    await waitFor(`!document.querySelector('[aria-label="Close tag management"]')`)
+    assert.equal(
+      await evaluate(`Boolean(document.querySelector('aside button[aria-label="Tags (Video)"]'))`),
+      false
+    )
+    await evaluate(`document.querySelector('aside button[aria-label="Tags"]').click()`)
+    await waitFor(`document.querySelector('[role="dialog"]')?.textContent.includes('Scraped tags')`)
+    await evaluate(`document.querySelector('[aria-label="Close tag management"]').click()`)
+    await waitFor(`!document.querySelector('[aria-label="Close tag management"]')`)
+    await evaluate(`document.querySelector('aside button[aria-label="JAV"]').click()`)
+    await waitFor(`window.testStore.getState().viewMode === 'jav'`)
+    assert.equal(
+      await evaluate(`Boolean(document.querySelector('header button[aria-label="Tags"]'))`),
+      false
+    )
+    await evaluate(`document.querySelector('aside button[aria-label="Tags"]').click()`)
+    await waitFor(`document.querySelector('[role="dialog"]')?.textContent.includes('Scraped tags')`)
     assert.deepEqual(await evaluate('window.appErrors'), [])
   }
 )

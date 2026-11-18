@@ -3,7 +3,61 @@ import test from 'node:test'
 import { browserUnavailable, openBrowser } from '../../helpers/browser.js'
 
 test(
-  'display settings cancel edits across all tabs without closing and keep default cursors',
+  'video directory bar defaults to visible and follows saved settings and restored defaults',
+  { skip: browserUnavailable, timeout: 60000 },
+  async (t) => {
+    const { origin, command, evaluate, waitFor } = await openBrowser(t, {
+      cacheDir: 'node_modules/.vite-display-settings-test',
+    })
+    await command('Page.navigate', { url: `${origin}/tests/fixtures/app.html?view=video` })
+    const bar = `document.querySelector('nav[aria-label="Current video directory"]')`
+    const dialog = `document.querySelector('[role="dialog"]')`
+    const toggle = `${dialog}.querySelector('[role="switch"][aria-label="Show bottom directory bar"]')`
+    const openSettings = async () => {
+      await evaluate(`document.querySelector('aside button[aria-label="Display"]').click()`)
+      await waitFor(toggle)
+    }
+    const clickFooter = (label) =>
+      evaluate(
+        `[...${dialog}.querySelectorAll('footer button')].find(button => button.textContent === '${label}').click()`
+      )
+    await waitFor(`${bar} && window.testStore.getState().config.video_page_size`)
+    await openSettings()
+    assert.equal(await evaluate(`${toggle}.getAttribute('aria-checked')`), 'true')
+    await evaluate(`${toggle}.click()`)
+    assert.ok(await evaluate(`Boolean(${bar})`), 'unsaved changes must not hide the bar')
+    await evaluate(`${dialog}.querySelector('[aria-label="Close settings"]').click()`)
+    await waitFor(`!${dialog}`)
+    await openSettings()
+    assert.equal(await evaluate(`${toggle}.getAttribute('aria-checked')`), 'true')
+    await evaluate(`${toggle}.click()`)
+    await clickFooter('Save')
+    await waitFor(`!${dialog} && !${bar}`)
+    assert.equal(
+      await evaluate('window.testStore.getState().config.video_show_directory_bar'),
+      false
+    )
+    await evaluate(
+      `window.testStore.setState({config:{}}); window.testStore.getState().loadConfig()`
+    )
+    await waitFor(`window.testStore.getState().config.video_page_size && !${bar}`)
+    await openSettings()
+    assert.equal(await evaluate(`${toggle}.getAttribute('aria-checked')`), 'false')
+    await clickFooter('Restore defaults')
+    assert.equal(await evaluate(`${toggle}.getAttribute('aria-checked')`), 'true')
+    assert.equal(await evaluate(`Boolean(${bar})`), false)
+    await clickFooter('Save')
+    await waitFor(`!${dialog} && ${bar}`)
+    assert.equal(
+      await evaluate('window.testStore.getState().config.video_show_directory_bar'),
+      true
+    )
+    assert.deepEqual(await evaluate('window.appErrors'), [])
+  }
+)
+
+test(
+  'display settings are editable immediately and closing discards all unsaved drafts',
   { skip: browserUnavailable, timeout: 60000 },
   async (t) => {
     const { origin, command, evaluate, waitFor } = await openBrowser(t, {
@@ -52,35 +106,24 @@ test(
         savedValues.set(tab, await evaluate(values))
         assert.deepEqual(
           await evaluate(`[...${footerButtons}].map(button => button.textContent)`),
-          ['Edit'],
+          ['Restore defaults', 'Save'],
           tab
         )
         assert.ok(
           await evaluate(
-            `[...${fields}.querySelectorAll(':disabled')].every(el => getComputedStyle(el).cursor === 'default')`
+            `[...${fields}.querySelectorAll('input, select, button[role="switch"]')].every(el => !el.matches(':disabled'))`
           ),
           tab
         )
-        assert.ok(
-          await evaluate(
-            `[...${fields}.querySelectorAll('input, select, button')].every(el => el.matches(':disabled'))`
-          ),
-          tab
-        )
-        // Disabled switches and sort buttons must not change the draft on click.
-        const before = await evaluate(`${fields}.innerHTML`)
-        await evaluate(`${fields}.querySelectorAll('button').forEach(button => button.click())`)
-        assert.equal(await evaluate(`${fields}.innerHTML`), before, tab)
       }
 
       const draftValues = new Map()
       for (const tab of tabs) {
         await selectTab(tab)
-        assert.equal(await evaluate(`${fields}.disabled`), true, tab)
-        await clickFooter('Edit')
+        assert.equal(await evaluate(`${fields}.disabled`), false, tab)
         assert.deepEqual(
           await evaluate(`[...${footerButtons}].map(button => button.textContent)`),
-          ['Restore defaults', 'Cancel', 'Save']
+          ['Restore defaults', 'Save']
         )
         assert.ok(
           await evaluate(
@@ -106,41 +149,22 @@ test(
         }
         draftValues.set(tab, await evaluate(values))
       }
-      await clickFooter('Cancel')
-      await waitFor(`${dialog} && ${fields}.disabled`)
-      if (view === 'jav') {
-        assert.equal(
-          await evaluate(
-            `${dialog}.querySelector('[role="tab"][aria-selected="true"]').textContent`
-          ),
-          'Tags'
-        )
-      }
       assert.equal(
         await evaluate(`window.requests.some(r => r.url === '/config' && r.method === 'PATCH')`),
         false
       )
-      assert.deepEqual(await evaluate(`[...${footerButtons}].map(button => button.textContent)`), [
-        'Edit',
-      ])
       for (const tab of tabs) {
         await selectTab(tab)
-        if (tab !== tabs.at(-1)) {
-          assert.equal(await evaluate(`${fields}.disabled`), false, tab)
-          assert.deepEqual(await evaluate(values), draftValues.get(tab), tab)
-          await clickFooter('Cancel')
-        }
-        assert.equal(await evaluate(`${fields}.disabled`), true)
-        assert.deepEqual(await evaluate(values), savedValues.get(tab), tab)
+        assert.deepEqual(await evaluate(values), draftValues.get(tab), tab)
       }
-      // Editing again starts from the saved values, not the cancelled draft.
-      await clickFooter('Edit')
-      assert.deepEqual(await evaluate(values), savedValues.get(tabs.at(-1)))
-      await clickFooter('Cancel')
       await evaluate(`${dialog}.querySelector('[aria-label="Close settings"]').click()`)
       await waitFor(`!${dialog}`)
       await openSettings()
-      assert.equal(await evaluate(`${fields}.disabled`), true)
+      for (const tab of tabs) {
+        await selectTab(tab)
+        assert.equal(await evaluate(`${fields}.disabled`), false)
+        assert.deepEqual(await evaluate(values), savedValues.get(tab), tab)
+      }
       await evaluate(`${dialog}.querySelector('[aria-label="Close settings"]').click()`)
       await waitFor(`!${dialog}`)
     }
@@ -182,11 +206,9 @@ test(
         return originalFetch(url, init);
       };
     }`)
-    await click('Edit')
     await setPageSize(40)
     await click('Idols')
-    assert.equal(await evaluate(`${fields}.disabled`), true)
-    await click('Edit')
+    assert.equal(await evaluate(`${fields}.disabled`), false)
     await setPageSize(48)
     await click('Save')
     await waitFor(`!${dialog} && window.testStore.getState().idolPageSize === 48`)
@@ -199,9 +221,8 @@ test(
     ])
     await evaluate(`document.querySelector('aside button[aria-label="Display"]').click()`)
     await waitFor(dialog)
-    assert.equal(await evaluate(`${fields}.disabled`), true)
+    assert.equal(await evaluate(`${fields}.disabled`), false)
     assert.equal(await evaluate(`${input}.value`), '24')
-    await click('Edit')
     await setPageSize(40)
     await evaluate('window.failSettingsSave = true')
     await click('Save')
@@ -216,66 +237,16 @@ test(
     await evaluate(`document.querySelector('aside button[aria-label="Display"]').click()`)
     await waitFor(dialog)
     await click('Idols')
-    assert.equal(await evaluate(`${fields}.disabled`), true)
+    assert.equal(await evaluate(`${fields}.disabled`), false)
     assert.equal(await evaluate(`${input}.value`), '48')
-    await click('Edit')
     await setPageSize(72)
-    await click('Cancel')
+    await evaluate(`${dialog}.querySelector('[aria-label="Close settings"]').click()`)
+    await waitFor(`!${dialog}`)
+    await evaluate(`document.querySelector('aside button[aria-label="Display"]').click()`)
+    await waitFor(dialog)
+    await click('Idols')
     assert.equal(await evaluate(`${input}.value`), '48')
     assert.equal(await evaluate('window.settingsSaves.length'), 3)
-  }
-)
-
-test(
-  'entering display editing preserves primary button focus and hover color without flashing',
-  { skip: browserUnavailable, timeout: 60000 },
-  async (t) => {
-    const { origin, command, evaluate, waitFor } = await openBrowser(t, {
-      cacheDir: 'node_modules/.vite-display-settings-test',
-    })
-    for (const view of ['jav', 'video']) {
-      await command('Page.navigate', { url: `${origin}/tests/fixtures/app.html?view=${view}` })
-      await waitFor(`document.querySelector('aside button[aria-label="Display"]')`)
-      await evaluate(`document.querySelector('aside button[aria-label="Display"]').click()`)
-      await waitFor(`document.querySelector('[role="dialog"] footer button')`)
-      const point = await evaluate(`(() => {
-        window.editButton = document.querySelector('[role="dialog"] footer button');
-        const rect = window.editButton.getBoundingClientRect();
-        return {x: rect.x + rect.width / 2, y: rect.y + rect.height / 2};
-      })()`)
-      await command('Input.dispatchMouseEvent', { type: 'mouseMoved', ...point })
-      await waitFor(`getComputedStyle(window.editButton).backgroundColor === 'rgb(29, 78, 216)'`)
-      await command('Input.dispatchMouseEvent', {
-        type: 'mousePressed',
-        ...point,
-        button: 'left',
-        clickCount: 1,
-      })
-      await command('Input.dispatchMouseEvent', {
-        type: 'mouseReleased',
-        ...point,
-        button: 'left',
-        clickCount: 1,
-      })
-      const frames = await evaluate(`new Promise(resolve => {
-        const frames = [];
-        const sample = () => {
-          const button = [...document.querySelectorAll('[role="dialog"] footer button')].find(button => button.textContent === 'Save');
-          frames.push({color: getComputedStyle(button).backgroundColor, focused: document.activeElement === button});
-          if (frames.length < 12) requestAnimationFrame(sample);
-          else resolve(frames);
-        };
-        sample();
-      })`)
-      assert.ok(
-        frames.every((frame) => frame.color === 'rgb(29, 78, 216)' && frame.focused),
-        view
-      )
-      assert.equal(
-        await evaluate(`window.requests.some(r => r.url === '/config' && r.method === 'PATCH')`),
-        false
-      )
-    }
   }
 )
 
@@ -316,11 +287,9 @@ test(
         await evaluate(`${dialog}.querySelector('[role="tab"][aria-selected="true"]').textContent`),
         'Videos'
       )
-      await click('Edit')
       await setPageSize(target === 'Videos' ? 40 : 60)
       await click('JAV')
-      assert.equal(await evaluate(`${fields}.disabled`), true)
-      await click('Edit')
+      assert.equal(await evaluate(`${fields}.disabled`), false)
       await setPageSize(48)
       await click('Videos')
       assert.equal(await evaluate(`${fields}.disabled`), false)

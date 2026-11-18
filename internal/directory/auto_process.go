@@ -465,7 +465,16 @@ func (m *Manager) startAutoProcessJob(ctx context.Context, job *autoProcessJob) 
 		return
 	}
 
-	err := m.startDirectoryProcessing(ctx, job.directory, job.mode, DirectoryProcessLayoutPrefix, true)
+	err := m.startDirectoryProcessing(
+		ctx,
+		job.directory,
+		job.mode,
+		DirectoryProcessLayoutPrefix,
+		true,  // noCoverWait：自动整理不逐条等封面，缺失的交给封面队列后续补写
+		false, // overwriteNFO：自动整理不覆盖第三方 NFO
+		"",    // targetFolder：不改变目录结构
+		true,  // exportFanart：保持 fork 原有行为，自动整理也写 fanart
+	)
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrDirectoryWorkInProgress), errors.Is(err, ErrDirectoryScanInProgress):

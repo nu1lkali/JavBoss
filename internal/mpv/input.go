@@ -168,6 +168,7 @@ func buildInputConfContent() (string, error) {
 	}
 
 	lines = append(lines, "SPACE cycle pause")
+	lines = append(lines, "MBTN_LEFT_DBL cycle fullscreen")
 	lines = append(lines, buildEscapeHotkeyBinding())
 	return strings.Join(lines, "\n") + "\n", nil
 }
@@ -201,7 +202,7 @@ func buildStartupHotkeyHint() (string, error) {
 		return "", err
 	}
 
-	parts := make([]string, 0, len(hotkeys)+2)
+	parts := make([]string, 0, len(hotkeys)+3)
 	for _, item := range hotkeys {
 		keyName, ok := keyName(item.Key)
 		if !ok {

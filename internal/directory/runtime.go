@@ -49,8 +49,8 @@ func CancelAndReserveDirectoryScan(ctx context.Context, id int64) (func(), error
 	return applicationTasks.Load().CancelAndReserveDirectoryScan(ctx, id)
 }
 
-func StartDirectoryProcessing(ctx context.Context, dir models.Directory, mode, layout string) error {
-	return applicationTasks.Load().StartDirectoryProcessing(ctx, dir, mode, layout)
+func StartDirectoryProcessing(ctx context.Context, dir models.Directory, mode, layout string, overwriteNFO bool, targetFolder string, exportFanart bool) error {
+	return applicationTasks.Load().StartDirectoryProcessing(ctx, dir, mode, layout, overwriteNFO, targetFolder, exportFanart)
 }
 
 // QueueAutoProcess 在扫描结束后登记一次自动整理。

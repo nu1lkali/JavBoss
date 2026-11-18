@@ -7,6 +7,12 @@ test('settings drafts stay local and a reopened dialog reads persisted values', 
   const state = useStore.getState()
   const draft = model.createVideoSettingsDraft(state)
   assert.equal(draft.videoWatchTimeIconMinutesInput, 30)
+  assert.equal(draft.videoShowDirectoryBarInput, true)
+  assert.equal(
+    model.createVideoSettingsDraft({ ...state, config: { video_show_directory_bar: 'false' } })
+      .videoShowDirectoryBarInput,
+    false
+  )
   draft.videoPageSizeInput = 100
   draft.videoHideJavInput = true
   assert.equal(useStore.getState().pageSize, state.pageSize)
@@ -22,6 +28,12 @@ test('settings drafts stay local and a reopened dialog reads persisted values', 
   assert.equal(model.createJavSettingsDraft(state).javWatchTimeIconMinutesInput, 30)
   assert.equal(javDraft.javHideTagsInput, false)
   assert.equal(javDraft.javHideSeriesInput, true)
+  assert.equal(javDraft.javHighSaturationTagsInput, true)
+  assert.equal(
+    model.createJavSettingsDraft({ ...state, config: { jav_high_saturation_tags: 'false' } }, 'jav')
+      .javHighSaturationTagsInput,
+    false
+  )
 })
 
 test('saving video settings persists normalized values and clamps the current page', async (t) => {
@@ -40,10 +52,16 @@ test('saving video settings persists normalized values and clamps the current pa
   draft.videoPageSizeInput = '40'
   draft.videoWatchTimeIconMinutesInput = '10'
   draft.videoWaterfallDefaultInput = true
+  draft.videoShowDirectoryBarInput = false
   const changes = []
   await actions.saveVideoSettings(draft, (...args) => changes.push(args))
   assert.equal(payload.video_page_size, 40)
   assert.equal(payload.video_watch_time_icon_minutes, 10)
+  assert.equal(payload.video_show_directory_bar, false)
+  assert.equal(
+    model.createVideoSettingsDraft(useStore.getState()).videoShowDirectoryBarInput,
+    false
+  )
   assert.equal(
     model.createVideoSettingsDraft(useStore.getState()).videoWatchTimeIconMinutesInput,
     10
@@ -298,7 +316,7 @@ test('saving one display tab only persists its fields and updates its list state
     }
     assert.equal(
       Object.keys(payload).length,
-      { jav: 16, idol: 4, studio: 2, series: 2, tag: 1 }[tab]
+      { jav: 17, idol: 4, studio: 2, series: 2, tag: 1 }[tab]
     )
     assert.deepEqual(changes, tab === 'tag' ? [] : [[tab, true]])
     if (tab !== 'jav') {

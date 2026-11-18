@@ -90,9 +90,17 @@ func (c *Client) handlePlay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mediaURL := c.localBaseURL + "/__client/media/" + token
+	title := strings.TrimSpace(request.Title)
+	if title == "" {
+		title = "Video #" + strconv.FormatInt(request.VideoID, 10)
+	}
 	dataDir := c.clientDataDir()
 	if err := c.playVideo(mediaURL, mpv.PlayOptions{
+		Title:                  title,
 		NewWatchReporter:       c.playbackReporter(request.VideoID, request.LocationID, cookie, request.Path, request.DirPath),
+		ResolveSubtitle:        c.subtitleResolver(request.VideoID, request.LocationID, cookie, request.Path, request.DirPath),
+		SaveSubtitleOffset:     c.subtitleOffsetSaver(request.VideoID, cookie),
+		SaveSubtitleSelection:  c.subtitleSelectionSaver(request.VideoID, cookie),
 		DataDir:                dataDir,
 		VideoID:                request.VideoID,
 		StartTimeSec:           request.StartTimeSec,

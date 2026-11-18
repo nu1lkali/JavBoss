@@ -56,6 +56,7 @@ const (
 var (
 	ErrInvalidDirectoryProcessMode   = errors.New("invalid directory process mode")
 	ErrInvalidDirectoryProcessLayout = errors.New("invalid directory process layout")
+	ErrInvalidDirectoryTargetFolder  = errors.New("invalid directory target folder")
 	ErrDirectoryWorkInProgress       = errors.New("directory work in progress")
 )
 
@@ -126,8 +127,8 @@ func (m *Manager) setDirectoryProcessingStatus(id int64, status string) {
 }
 
 // StartDirectoryProcessing reserves the directory and starts an asynchronous filesystem job.
-func (m *Manager) StartDirectoryProcessing(ctx context.Context, directory models.Directory, mode, layout string) error {
-	return m.startDirectoryProcessing(ctx, directory, mode, layout, false)
+func (m *Manager) StartDirectoryProcessing(ctx context.Context, directory models.Directory, mode, layout string, overwriteNFO bool, targetFolder string, exportFanart bool) error {
+	return m.startDirectoryProcessing(ctx, directory, mode, layout, false, overwriteNFO, targetFolder, exportFanart)
 }
 
 // startDirectoryProcessing 是 StartDirectoryProcessing 的内部实现。
@@ -140,6 +141,9 @@ func (m *Manager) startDirectoryProcessing(
 	directory models.Directory,
 	mode, layout string,
 	noCoverWait bool,
+	overwriteNFO bool,
+	targetFolder string,
+	exportFanart bool,
 ) error {
 	if err := m.ctx.Err(); err != nil {
 		return err
@@ -152,6 +156,12 @@ func (m *Manager) startDirectoryProcessing(
 	layout, ok = directoryProcessLayout(layout)
 	if !ok {
 		return ErrInvalidDirectoryProcessLayout
+	}
+	if mode != DirectoryProcessSidecar {
+		targetFolder, ok = directoryProcessTargetFolder(directory.Path, targetFolder)
+		if !ok {
+			return ErrInvalidDirectoryTargetFolder
+		}
 	}
 	if directory.ID <= 0 || directory.IsDelete {
 		return errors.New("invalid directory")
@@ -179,7 +189,7 @@ func (m *Manager) startDirectoryProcessing(
 		defer release()
 
 		startedAt := time.Now()
-		summary, processErr := ProcessDirectory(processCtx, m.coverDir, directory, mode, layout)
+		summary, processErr := ProcessDirectory(processCtx, m.coverDir, directory, mode, layout, overwriteNFO, targetFolder, exportFanart)
 		finishedAt := time.Now()
 		if processErr != nil {
 			logging.Error("directory processing failed id=%d mode=%s err=%v", directory.ID, mode, processErr)
@@ -210,6 +220,7 @@ func (m *Manager) startDirectoryProcessing(
 			processErr,
 			startedAt,
 			finishedAt,
+			targetFolder,
 		); err != nil {
 			logging.Error("write directory processing report failed id=%d path=%s err=%v", directory.ID, directory.Path, err)
 		}
@@ -225,6 +236,33 @@ func (m *Manager) startDirectoryProcessing(
 		}
 	}()
 	return nil
+}
+
+// directoryProcessTargetFolder accepts a folder name inside the selected directory.
+func directoryProcessTargetFolder(root, value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		value = directoryOrganizeParent
+	}
+	if value == "." || value == ".." || strings.HasSuffix(value, ".") ||
+		strings.ContainsAny(value, `<>:"/\|?*`) || strings.ContainsFunc(value, unicode.IsControl) {
+		return "", false
+	}
+	// Windows device names are invalid even with an extension.
+	base, _, _ := strings.Cut(strings.ToUpper(value), ".")
+	switch base {
+	case "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9":
+		return "", false
+	}
+	info, err := os.Lstat(filepath.Join(root, value))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", false
+	}
+	if err == nil && !info.IsDir() {
+		return "", false
+	}
+	return value, true
 }
 
 func directoryProcessLayout(layout string) (string, bool) {
@@ -247,6 +285,9 @@ func ProcessDirectory(
 	directory models.Directory,
 	mode string,
 	layout string,
+	overwriteNFO bool,
+	targetFolder string,
+	exportFanart bool,
 ) (*DirectoryProcessSummary, error) {
 	normalizedMode, _, ok := directoryProcessMode(mode)
 	if !ok {
@@ -256,6 +297,12 @@ func ProcessDirectory(
 	layout, ok = directoryProcessLayout(layout)
 	if !ok {
 		return nil, ErrInvalidDirectoryProcessLayout
+	}
+	if mode != DirectoryProcessSidecar {
+		targetFolder, ok = directoryProcessTargetFolder(directory.Path, targetFolder)
+		if !ok {
+			return nil, ErrInvalidDirectoryTargetFolder
+		}
 	}
 	if strings.TrimSpace(directory.Path) == "" {
 		return nil, errors.New("directory path is empty")
@@ -272,7 +319,7 @@ func ProcessDirectory(
 			cleanupEmptySourceDirectories(directory.Path, summary)
 			return summary, err
 		}
-		processJavItem(ctx, directory.Path, &items[i], mode, layout, coverDir, summary)
+		processJavItem(ctx, directory.Path, &items[i], mode, layout, coverDir, summary, overwriteNFO, targetFolder, exportFanart)
 	}
 	cleanupEmptySourceDirectories(directory.Path, summary)
 	if err := ctx.Err(); err != nil {
@@ -289,6 +336,9 @@ func processJavItem(
 	layout string,
 	coverDir string,
 	summary *DirectoryProcessSummary,
+	overwriteNFO bool,
+	targetFolder string,
+	exportFanart bool,
 ) {
 	if item == nil || summary == nil {
 		return
@@ -329,7 +379,7 @@ func processJavItem(
 			if layout == DirectoryProcessLayoutCode {
 				target, err = safeDirectoryFilePath(
 					root,
-					filepath.Join(directoryOrganizeParent, code, filepath.Base(source)),
+					filepath.Join(targetFolder, code, filepath.Base(source)),
 				)
 			} else {
 				if layout == DirectoryProcessLayoutIdol {
@@ -337,7 +387,7 @@ func processJavItem(
 				}
 				target, err = safeDirectoryFilePath(
 					root,
-					filepath.Join(directoryOrganizeParent, group, code, filepath.Base(source)),
+					filepath.Join(targetFolder, group, code, filepath.Base(source)),
 				)
 			}
 			if err != nil {
@@ -374,7 +424,7 @@ func processJavItem(
 		}
 
 		if mode == DirectoryProcessSidecar || mode == DirectoryProcessOrganizeWithSidecar {
-			result, err := writeJavSidecars(ctx, target, item, coverDir)
+			result, err := writeJavSidecars(ctx, target, item, coverDir, overwriteNFO, exportFanart)
 			if result.changed() {
 				summary.Sidecars++
 			}
@@ -631,14 +681,14 @@ func directoryProcessModeDisplay(mode string) string {
 	}
 }
 
-func directoryProcessLayoutDisplay(layout string) string {
+func directoryProcessLayoutDisplay(layout, targetFolder string) string {
 	switch layout {
 	case DirectoryProcessLayoutCode:
-		return "按完整番号（JAV/番号）"
+		return fmt.Sprintf("按完整番号（%s/番号）", targetFolder)
 	case DirectoryProcessLayoutIdol:
-		return "按女优（JAV/女优/番号）"
+		return fmt.Sprintf("按女优（%s/女优/番号）", targetFolder)
 	default:
-		return "按番号前缀（JAV/前缀/番号）"
+		return fmt.Sprintf("按番号前缀（%s/前缀/番号）", targetFolder)
 	}
 }
 
@@ -679,6 +729,7 @@ func writeDirectoryProcessReport(
 	processErr error,
 	startedAt time.Time,
 	finishedAt time.Time,
+	targetFolder string,
 ) error {
 	root = filepath.Clean(strings.TrimSpace(root))
 	if root == "" || !filepath.IsAbs(root) {
@@ -694,7 +745,7 @@ func writeDirectoryProcessReport(
 	fmt.Fprintf(&builder, "完成时间：%s\n", finishedAt.Format("2006-01-02 15:04:05"))
 	fmt.Fprintf(&builder, "处理模式：%s\n", directoryProcessModeDisplay(mode))
 	if mode != DirectoryProcessSidecar {
-		fmt.Fprintf(&builder, "整理方式：%s\n", directoryProcessLayoutDisplay(layout))
+		fmt.Fprintf(&builder, "整理方式：%s\n", directoryProcessLayoutDisplay(layout, targetFolder))
 	}
 	if processErr != nil {
 		fmt.Fprintf(&builder, "任务结果：未完成（%s）\n", reportLineValue(directoryProcessFailureReason(processErr)))
@@ -994,7 +1045,10 @@ func (r sidecarResult) changed() bool {
 // poster lands in the same run instead of requiring a second pass. When the
 // download is not configured or times out, the request is queued and the item
 // is reported as posterPending.
-func writeJavSidecars(ctx context.Context, videoPath string, item *models.Jav, coverDir string) (sidecarResult, error) {
+//
+// overwriteNFO 来自整理面板的"覆盖已有 NFO"开关：为 true 时即使 NFO 由别的
+// 工具写过也允许覆盖；exportFanart 控制是否额外导出一份完整封套作为背景图。
+func writeJavSidecars(ctx context.Context, videoPath string, item *models.Jav, coverDir string, overwriteNFO, exportFanart bool) (sidecarResult, error) {
 	var result sidecarResult
 
 	info, err := os.Stat(videoPath)
@@ -1007,10 +1061,10 @@ func writeJavSidecars(ctx context.Context, videoPath string, item *models.Jav, c
 
 	base := strings.TrimSuffix(videoPath, filepath.Ext(videoPath))
 	nfoPath := base + ".nfo"
-	_, nfoErr := canWriteJavBossNFO(nfoPath)
+	_, nfoErr := canWriteJavBossNFO(nfoPath, overwriteNFO)
 	if nfoErr != nil && !errors.Is(nfoErr, errNFOUnownedByOtherTool) {
 		// Unreadable NFO: still try the cover, then surface the NFO problem.
-		if _, coverErr := writeJavPoster(ctx, base, item, coverDir, &result); coverErr != nil {
+		if _, coverErr := writeJavPoster(ctx, base, item, coverDir, exportFanart, &result); coverErr != nil {
 			logging.Error("write JAV poster failed path=%s code=%s err=%v", videoPath, item.Code, coverErr)
 		}
 		return result, nfoErr
@@ -1022,7 +1076,7 @@ func writeJavSidecars(ctx context.Context, videoPath string, item *models.Jav, c
 		// 无条件重写只会把 NFO 的 mtime 刷成当天，对用户没有任何收益。
 		written, writeErr := writeNFOIfChanged(nfoPath, makeJellyfinNFO(item))
 		if writeErr != nil {
-			if _, coverErr := writeJavPoster(ctx, base, item, coverDir, &result); coverErr != nil {
+			if _, coverErr := writeJavPoster(ctx, base, item, coverDir, exportFanart, &result); coverErr != nil {
 				logging.Error("write JAV poster failed path=%s code=%s err=%v", videoPath, item.Code, coverErr)
 			}
 			return result, writeErr
@@ -1031,7 +1085,7 @@ func writeJavSidecars(ctx context.Context, videoPath string, item *models.Jav, c
 	}
 
 	// 海报只在缺失时生成，已存在就原样保留（详见 writeJavPoster 的说明）。
-	if _, err := writeJavPoster(ctx, base, item, coverDir, &result); err != nil {
+	if _, err := writeJavPoster(ctx, base, item, coverDir, exportFanart, &result); err != nil {
 		return result, err
 	}
 	return result, nil
@@ -1051,6 +1105,7 @@ func writeJavPoster(
 	base string,
 	item *models.Jav,
 	coverDir string,
+	exportFanart bool,
 	result *sidecarResult,
 ) (string, error) {
 	coverPath, ok := cover.FindPath(coverDir, item.Code)
@@ -1080,13 +1135,13 @@ func writeJavPoster(
 		// 已有海报：本轮无事可做。
 		result.coverSkipped = true
 		// 即使跳过海报，也要补齐可能缺失的 fanart。
-		writeJavFanart(ctx, base, item, coverPath, result)
+		writeJavFanart(ctx, base, item, coverPath, exportFanart, result)
 		return posterPath, nil
 	}
 	if crop := posterCropFraction(); crop > 0 {
 		if cropped, err := writeCroppedPoster(coverPath, posterPath, crop); err == nil && cropped {
 			result.posterWritten = true
-			writeJavFanart(ctx, base, item, coverPath, result)
+			writeJavFanart(ctx, base, item, coverPath, exportFanart, result)
 			return posterPath, nil
 		} else if err != nil {
 			// 裁剪失败不阻断整理：回退为整图复制，保证媒体库至少有封面可用。
@@ -1098,7 +1153,7 @@ func writeJavPoster(
 		return "", fmt.Errorf("write poster: %w", err)
 	}
 	result.posterWritten = true
-	writeJavFanart(ctx, base, item, coverPath, result)
+	writeJavFanart(ctx, base, item, coverPath, exportFanart, result)
 	return posterPath, nil
 }
 
@@ -1119,11 +1174,14 @@ func javFanartFileName(base, coverExt string) string {
 // fanart 与 poster 互补：poster 是裁掉左侧小图的竖版主图，fanart 保留整幅封套。
 // 两者都是"写一次就冻结"的派生文件：缺失（或为空文件）才补写，已存在一律不动。
 // 想换封套，删掉这个文件再整理一次即可。任何失败都只记录日志，不阻断整理流程。
-func writeJavFanart(ctx context.Context, base string, item *models.Jav, coverPath string, result *sidecarResult) {
+//
+// exportFanart 是整理面板里的"导出背景图"开关；环境变量 JAVBOSS_POSTER_FANART=0
+// 仍然可以整体关闭该功能，两者任一为否都不写。
+func writeJavFanart(ctx context.Context, base string, item *models.Jav, coverPath string, exportFanart bool, result *sidecarResult) {
 	if err := ctx.Err(); err != nil {
 		return
 	}
-	if !fanartEnabled() {
+	if !exportFanart || !fanartEnabled() {
 		return
 	}
 	target := javFanartFileName(base, filepath.Ext(coverPath))
@@ -1254,7 +1312,23 @@ func ensureCover(ctx context.Context, code string) (string, bool) {
 	return "", false
 }
 
-func canWriteJavBossNFO(path string) (bool, error) {
+func canWriteSidecarImage(path string, owned bool) (bool, error) {
+	_, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("inspect sidecar image: %w", err)
+	}
+	return owned, nil
+}
+
+// canWriteJavBossNFO 判断现有 NFO 是否允许 JavBoss 改写。
+//
+// 返回的 owned 表示 NFO 是否由 JavBoss 生成过。NFO 属于别的刮削器时返回
+// errNFOUnownedByOtherTool，调用方据此"保留但不报错"，仍然去补缺失的封面；
+// overwriteNFO 为 true（整理面板勾选了"覆盖已有 NFO"）时无视归属，直接放行。
+func canWriteJavBossNFO(path string, overwriteNFO bool) (bool, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -1262,10 +1336,11 @@ func canWriteJavBossNFO(path string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("read existing NFO: %w", err)
 	}
-	if !strings.Contains(string(data), "<generator>JavBoss</generator>") {
+	owned := strings.Contains(string(data), "<generator>JavBoss</generator>")
+	if !owned && !overwriteNFO {
 		return false, errNFOUnownedByOtherTool
 	}
-	return true, nil
+	return owned, nil
 }
 
 // encodeNFO 生成 NFO 的最终字节。抽出来是为了让「内容有没有变」可以先比较再落盘。

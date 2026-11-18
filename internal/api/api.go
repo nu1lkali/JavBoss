@@ -3,11 +3,22 @@ package api
 import (
 	"net/http"
 
+	"javboss/internal/update"
+
 	"github.com/gin-gonic/gin"
 )
 
 // RegisterRoutes wires handlers onto the provided router.
 func RegisterRoutes(router gin.IRoutes) {
+	// Update status/check/install have no query parameters. Installation uses the
+	// official release selected by the server and requires normal session auth.
+	for _, route := range []struct{ method, path string }{
+		{http.MethodGet, "/system/update"},
+		{http.MethodPost, "/system/update/check"},
+		{http.MethodPost, "/system/update/install"},
+	} {
+		router.Handle(route.method, route.path, func(c *gin.Context) { update.ServeHTTP(c.Writer, c.Request, "/system/update") })
+	}
 	router.GET("/auth/extension-tokens", listExtensionTokens)
 	router.POST("/auth/extension-tokens", createExtensionToken)
 	router.POST("/auth/extension-tokens/:id/rotate", rotateExtensionToken)
@@ -20,16 +31,21 @@ func RegisterRoutes(router gin.IRoutes) {
 	router.GET("/tools", getTools)
 	router.POST("/tools/ffmpeg/download", downloadFFmpeg)
 	router.GET("/videos", listVideos)
+	router.GET("/videos/directories", listVideoDirectories)
 	router.GET("/videos/watched-time", getWatchedTime)
 	router.GET("/videos/watched-time/events", streamWatchedTime)
 	router.GET("/videos/screenshots", listVideosScreenshots)
 	router.GET("/videos/:id", getVideo)
 	router.GET("/videos/:id/streams", getVideoStreams)
+	router.POST("/videos/:id/subtitles/resolve", resolveSubtitle)
+	router.GET("/videos/:id/subtitle-settings", videoSubtitleSettings)
+	router.PATCH("/videos/:id/subtitle-settings", videoSubtitleSettings)
 	router.GET("/videos/:id/stream", streamVideo)
 	router.HEAD("/videos/:id/stream", streamVideo)
 	router.GET("/videos/:id/stream.m3u8", streamHLSManifest)
 	router.GET("/videos/:id/stream.m3u8/:segment", streamHLSSegment)
 	router.GET("/videos/:id/thumbnail", getThumbnail)
+	router.GET("/videos/:id/preview", getVideoPreview)
 	router.PUT("/videos/:id/cover", updateVideoCover)
 	router.DELETE("/videos/:id/cover", resetVideoCover)
 	router.GET("/videos/:id/screenshots", listVideoScreenshots)
@@ -57,6 +73,8 @@ func RegisterRoutes(router gin.IRoutes) {
 	router.GET("/directories/browse", browseDirectories)
 	router.POST("/directories/:id/process", processDirectory)
 	router.POST("/directories/:id/scan", scanDirectory)
+	router.POST("/directories/:id/cleanup/preview", previewDirectoryCleanup)
+	router.POST("/directories/:id/cleanup", cleanDirectoryFiles)
 	// 独立前缀，避免与 /directories/:id 的通配段冲突（gin 同一方法树里
 	// 静态段和 :id 通配段不能并存）。
 	router.POST("/nfo/rebuild", rebuildDirectoriesNFO)

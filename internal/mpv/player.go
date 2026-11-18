@@ -30,6 +30,10 @@ const (
 )
 
 type PlayOptions struct {
+	Title                  string
+	ResolveSubtitle        SubtitleResolver
+	SaveSubtitleOffset     SubtitleOffsetSaver
+	SaveSubtitleSelection  SubtitleSelectionSaver
 	NewWatchReporter       func() *playback.Reporter
 	DataDir                string
 	VideoID                int64
@@ -83,8 +87,8 @@ var (
 
 // PlayVideo launches mpv to play the given file path.
 func PlayVideo(path string, options PlayOptions) error {
-	if options.NewWatchReporter != nil {
-		return PlayPlaylist([]PlaylistItem{{Path: path, Options: options}})
+	if options.NewWatchReporter != nil || options.ResolveSubtitle != nil || options.SaveSubtitleOffset != nil || options.SaveSubtitleSelection != nil {
+		return PlayPlaylist([]PlaylistItem{{Path: path, Title: options.Title, Options: options}})
 	}
 	cancelFocusRestoreAttempts()
 	rememberFocusRestoreOwner(0)
@@ -381,17 +385,29 @@ func (s *playerSession) playPlaylistLocked(items []PlaylistItem) error {
 		return errors.New("playlist changed while loading")
 	}
 	callbacks := make(map[int64]func(), len(items))
+	subtitles := make(map[int64]SubtitleResolver, len(items))
+	subtitleSavers := make(map[int64]SubtitleOffsetSaver, len(items))
+	subtitleSelectionSavers := make(map[int64]SubtitleSelectionSaver, len(items))
+	editableSubtitles := make(map[string]bool, len(items))
 	reporters := make(map[int64]func() *playback.Reporter, len(items))
 	titles := make(map[string]string, len(items))
 	for index, entry := range entries {
 		callbacks[entry.ID] = items[index].OnStarted
+		subtitles[entry.ID] = items[index].Options.ResolveSubtitle
+		subtitleSavers[entry.ID] = items[index].Options.SaveSubtitleOffset
+		subtitleSelectionSavers[entry.ID] = items[index].Options.SaveSubtitleSelection
+		editableSubtitles[strconv.FormatInt(entry.ID, 10)] = subtitleSavers[entry.ID] != nil
 		reporters[entry.ID] = items[index].Options.NewWatchReporter
 		if title := strings.TrimSpace(items[index].Title); title != "" {
 			titles[strconv.FormatInt(entry.ID, 10)] = title
 		}
 	}
 	s.events.setCallbacks(callbacks)
+	s.events.setSubtitles(subtitles, subtitleSavers, subtitleSelectionSavers)
 	s.events.setWatchReporters(reporters)
+	if err := runIPCCommand(s.ipcPath, []any{"set_property", "user-data/javboss/subtitle-editable-entries", editableSubtitles}); err != nil {
+		return err
+	}
 	if err := runIPCCommand(s.ipcPath, []any{"set_property", "user-data/javboss/playlist-titles", titles}); err != nil {
 		return err
 	}
@@ -457,6 +473,7 @@ func buildCommandArgs(path string, options PlayOptions, ipcPath string, startIdl
 		return nil, err
 	}
 	args := make([]string, 0, 12)
+	args = append(args, "--script="+modernZ.SubtitleScriptPath)
 	args = append(args, "--config-dir="+modernZ.ConfigDir)
 	if runtime.GOOS == "linux" && os.Getenv("JAVBOSS_BUILD_MODE") != "release" {
 		args = append(args, "--vo=x11")
@@ -490,6 +507,9 @@ func buildCommandArgs(path string, options PlayOptions, ipcPath string, startIdl
 	args = append(args, buildPlaybackStartArgs(options)...)
 	args = append(args, "--input-conf="+inputConfPath)
 	if strings.TrimSpace(path) != "" {
+		if title := strings.TrimSpace(options.Title); title != "" {
+			args = append(args, "--force-media-title="+title)
+		}
 		args = append(args, "--", path)
 	}
 	return exec.Command(mpvPath, args...), nil
@@ -581,12 +601,13 @@ func isOptionalPlaybackCommand(command []any) bool {
 }
 
 func buildLoadFileCommand(path string, options PlayOptions) ([]any, error) {
-	return buildPlaylistLoadFileCommand(PlaylistItem{Path: path, Options: options}, "replace")
+	return buildPlaylistLoadFileCommand(PlaylistItem{Path: path, Title: options.Title, Options: options}, "replace")
 }
 
 func buildPlaylistLoadFileCommand(item PlaylistItem, mode string) ([]any, error) {
 	options := map[string]string{
 		"screenshot-template": playbackScreenshotTemplate,
+		"sub-delay":           "0",
 	}
 	if title := strings.TrimSpace(item.Title); title != "" {
 		options["force-media-title"] = title

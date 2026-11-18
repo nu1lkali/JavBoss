@@ -7,12 +7,7 @@ import DisplaySettingsModal from '@/features/settings/components/DisplaySettings
 
 export default function DisplaySettings({ onClose, onError, onWaterfallChange, initialTab }) {
   const [draft, setDraft] = useState(() => createDisplaySettingsDraft(useStore.getState()))
-  const [editingTabs, setEditingTabs] = useState({})
   const [savingTabs, setSavingTabs] = useState({})
-  const resetTabDraft = (tab) => {
-    const saved = createDisplaySettingsDraft(useStore.getState(), tab)
-    setDraft((current) => ({ ...current, ...saved }))
-  }
   const handleSave = async (tab) => {
     if (savingTabs[tab]) return
     setSavingTabs((current) => ({ ...current, [tab]: true }))
@@ -31,16 +26,7 @@ export default function DisplaySettings({ onClose, onError, onWaterfallChange, i
       open={true}
       initialTab={initialTab}
       onClose={() => onClose()}
-      editingTabs={editingTabs}
       savingTabs={savingTabs}
-      onEdit={(tab) => {
-        resetTabDraft(tab)
-        setEditingTabs((current) => ({ ...current, [tab]: true }))
-      }}
-      onCancel={(tab) => {
-        resetTabDraft(tab)
-        setEditingTabs((current) => ({ ...current, [tab]: false }))
-      }}
       videoSettings={{
         pageSizeInput: draft.videoPageSizeInput,
         onPageSizeChange: (value) =>
@@ -51,6 +37,9 @@ export default function DisplaySettings({ onClose, onError, onWaterfallChange, i
         onHideJavChange: (value) =>
           setDraft((current) => ({ ...current, videoHideJavInput: value })),
         waterfallDefaultInput: draft.videoWaterfallDefaultInput,
+        showDirectoryBarInput: draft.videoShowDirectoryBarInput,
+        onShowDirectoryBarChange: (value) =>
+          setDraft((current) => ({ ...current, videoShowDirectoryBarInput: value })),
         onWaterfallDefaultChange: (value) =>
           setDraft((current) => ({ ...current, videoWaterfallDefaultInput: value })),
         watchTimeIconMinutesInput: draft.videoWatchTimeIconMinutesInput,
@@ -78,6 +67,10 @@ export default function DisplaySettings({ onClose, onError, onWaterfallChange, i
         setDraft((current) => ({ ...current, javIdolTagMaxRowsInput: value }))
       }
       javTagMaxRowsInput={draft.javTagMaxRowsInput}
+      javHighSaturationTagsInput={draft.javHighSaturationTagsInput}
+      onJavHighSaturationTagsChange={(value) =>
+        setDraft((current) => ({ ...current, javHighSaturationTagsInput: value }))
+      }
       onJavTagMaxRowsChange={(value) =>
         setDraft((current) => ({ ...current, javTagMaxRowsInput: value }))
       }
