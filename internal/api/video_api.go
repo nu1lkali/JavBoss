@@ -260,9 +260,12 @@ func buildStrmPlaybackInfo(video *models.Video, locationID int64, target util.St
 	}
 
 	// 本地目标：直连由服务端代理跳转，HLS 走常规切片流程。
+	// 直连地址用 video.Path / video.DirectoryRef.Path 拼参数，而这两个字段
+	// 已由 GetVideoForPlayback(ctx, id, locationID) 按选中位置填充，
+	// 因此不需要再往 URL 里带 location_id（HLS 侧才用 location_id 选流）。
 	info.Sources = append(info.Sources, playbackSource{
 		Kind:     "direct",
-		Src:      buildDirectStreamURL(video, locationID),
+		Src:      buildDirectStreamURL(video),
 		MimeType: directMimeType(strings.TrimPrefix(target.Extension, ".")),
 		Label:    "Direct",
 	})
